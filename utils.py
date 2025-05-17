@@ -1,10 +1,9 @@
 import ccxt
 import requests
+from datetime import datetime
+from config import api_key, secret, password, symbol
 
-api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'
-secret = '05A665CEAF8B2161483DF63CB10085D2'
-password = 'Jirawat1-'
-
+# Setup OKX
 exchange = ccxt.okx({
     'apiKey': api_key,
     'secret': secret,
@@ -12,13 +11,28 @@ exchange = ccxt.okx({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
 })
+exchange.set_sandbox_mode(False)
 
-def fetch_candles():
-    return exchange.fetch_ohlcv('BTC/USDT:USDT', timeframe='15m', limit=210)
+def telegram(message):
+    from config import telegram_token, telegram_chat_id
+    try:
+        requests.get(f'https://api.telegram.org/bot{telegram_token}/sendMessage',
+                     params={'chat_id': telegram_chat_id, 'text': message})
+    except Exception:
+        pass
+
+def fetch_candles(tf='15m', limit=100):
+    return exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
 
 def fetch_price():
-    return float(exchange.fetch_ticker('BTC/USDT:USDT')['last'])
+    return float(exchange.fetch_ticker(symbol)['last'])
 
-def get_balance():
+def fetch_balance():
     balance = exchange.fetch_balance()
     return balance['total']['USDT']
+
+def cancel_all_orders():
+    exchange.cancel_all_orders(symbol)
+
+def format_time():
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
