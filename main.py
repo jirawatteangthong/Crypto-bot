@@ -1,116 +1,191 @@
+import ccxt
 import time
+import requests
 from datetime import datetime, timedelta
-from config import symbol, position_size, cooldown_after_sl_minutes, check_balance_every_hours
-from utils import exchange, fetch_price, telegram, fetch_balance, format_time
-from strategy import detect_ema_crossover
 
-active_order = None
-order_count = 0
-sl_hit_count = 0
-last_sl_time = None
-last_balance_check = datetime.utcnow()
+# === ตั้งค่า ===
+api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'
+secret = '05A665CEAF8B2161483DF63CB10085D2'
+password = 'Jirawat1-'
 
-def open_order(direction):
+symbol = 'BTC/USDT:USDT'
+timeframe = '15m'
+order_size = 0.5
+leverage = 20
+tp_value = 500
+sl_value = 250
+
+telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
+telegram_chat_id = '8104629569'
+
+max_trades_per_day = 3
+max_sl_per_day = 2
+
+# === ตัวแปรสถานะ ===
+trade_count = 0
+sl_count = 0
+active_position = False
+last_trade_day = None
+
+# === ตั้งค่า OKX ===
+exchange = ccxt.okx({
+    'apiKey': api_key,
+    'secret': secret,
+    'password': password,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
+exchange.set_sandbox_mode(False)
+
+# === Telegram แจ้งเตือน ===
+def telegram(msg):
+    try:
+        requests.get(
+            f'https://api.telegram.org/bot{telegram_token}/sendMessage',
+            params={'chat_id': telegram_chat_id, 'text': msg}
+        )
+    except Exception as e:
+        print(f"ส่ง Telegram ไม่สำเร็จ: {e}")
+
+# === ดึงข้อมูล ===
+def get_ohlcv():
+    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+
+def calculate_ema(prices, period):
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+# === เช็คจุดตัด EMA ===
+def detect_cross():
+    candles = get_ohlcv()
+    closes = [c[4] for c in candles]
+    ema50_prev = calculate_ema(closes[:-1], 50)
+    ema200_prev = calculate_ema(closes[:-1], 200)
+    ema50_now = calculate_ema(closes, 50)
+    ema200_now = calculate_ema(closes, 200)
+
+    if ema50_prev < ema200_prev and ema50_now > ema200_now:
+        return 'long'
+    elif ema50_prev > ema200_prev and ema50_now < ema200_now:
+        return 'short'
+    return None
+
+# === เปิดออเดอร์พร้อม TP/SL ===
+def open_position(direction):
+    global active_position, trade_count
+
+    price = float(exchange.fetch_ticker(symbol)['last'])
     side = 'buy' if direction == 'long' else 'sell'
-    price = fetch_price()
-    sl = price - 250 if direction == 'long' else price + 250
-    tp = price + 500 if direction == 'long' else price - 500
+    opposite = 'sell' if side == 'buy' else 'buy'
+
+    tp = price + tp_value if direction == 'long' else price - tp_value
+    sl = price - sl_value if direction == 'long' else price + sl_value
 
     params = {
         'tdMode': 'cross',
         'ordType': 'market',
-        'stopLoss': {'triggerPrice': round(sl, 2)},
-        'takeProfit': {'triggerPrice': round(tp, 2)},
+        'posSide': 'long' if direction == 'long' else 'short',
+        'lever': str(leverage)
     }
 
     try:
-        order = exchange.create_order(symbol, 'market', side, position_size, None, params)
-        telegram(f"เปิด {direction.upper()} ที่ {price}\nTP: {tp}, SL: {sl}")
-        return price, tp, sl, direction, order['id']
+        order = exchange.create_order(symbol, 'market', side, order_size, None, params)
+        telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}\nSL: {sl}")
+
+        # ตั้ง TP/SL
+        tp_order = exchange.create_order(symbol, 'take_profit', opposite, order_size, tp, {
+            'tdMode': 'cross',
+            'posSide': params['posSide'],
+            'tpTriggerPx': tp,
+            'ordType': 'limit'
+        })
+
+        sl_order = exchange.create_order(symbol, 'stop_loss', opposite, order_size, sl, {
+            'tdMode': 'cross',
+            'posSide': params['posSide'],
+            'slTriggerPx': sl,
+            'ordType': 'market'
+        })
+
+        trade_count += 1
+        active_position = True
+        return price, direction
+
     except Exception as e:
         telegram(f"[ERROR เปิดออเดอร์] {e}")
-        return None
+        return None, None
 
-def monitor_trade(entry, tp, sl, direction, order_id):
-    global last_sl_time, sl_hit_count, active_order
-    moved_to_breakeven = False
+# === เลื่อน SL ไปกันทุน ===
+def move_sl_to_breakeven(entry_price, direction):
+    try:
+        sl = entry_price
+        side = 'sell' if direction == 'long' else 'buy'
+        posSide = 'long' if direction == 'long' else 'short'
+        exchange.create_order(symbol, 'stop_loss', side, order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'slTriggerPx': sl,
+            'ordType': 'market'
+        })
+        telegram(f"เลื่อน SL ไปที่กันทุน: {sl} ({direction})")
+    except Exception as e:
+        telegram(f"[ERROR เลื่อน SL] {e}")
+
+# === ตรวจสถานะ TP/SL ===
+def monitor(entry_price, direction):
+    global active_position, sl_count
 
     while True:
-        price = fetch_price()
-        if direction == 'long':
-            if not moved_to_breakeven and price >= entry + 250:
-                sl = entry
-                moved_to_breakeven = True
-                telegram("ระบบได้กันทุนแล้ว")
-            if price <= sl:
-                telegram(f"SL ทำงาน (Long) ที่ {price} - ขาดทุน")
-                last_sl_time = datetime.utcnow()
-                sl_hit_count += 1
-                break
-            elif price >= tp:
-                telegram(f"TP ถึงเป้า (Long) ที่ {price} - กำไร")
-                break
-        else:
-            if not moved_to_breakeven and price <= entry - 250:
-                sl = entry
-                moved_to_breakeven = True
-                telegram("ระบบได้กันทุนแล้ว")
-            if price >= sl:
-                telegram(f"SL ทำงาน (Short) ที่ {price} - ขาดทุน")
-                last_sl_time = datetime.utcnow()
-                sl_hit_count += 1
-                break
-            elif price <= tp:
-                telegram(f"TP ถึงเป้า (Short) ที่ {price} - กำไร")
-                break
+        price = float(exchange.fetch_ticker(symbol)['last'])
+        profit = price - entry_price if direction == 'long' else entry_price - price
+
+        if profit >= 250:
+            move_sl_to_breakeven(entry_price, direction)
+            break
+
+        if profit >= tp_value or profit <= -sl_value:
+            telegram(f"ปิดออเดอร์ {direction.upper()} ที่ราคา {price} / กำไร: {profit:.2f}")
+            if profit < 0:
+                sl_count += 1
+            active_position = False
+            break
 
         time.sleep(10)
 
-    active_order = None
-
+# === MAIN LOOP ===
 def main():
-    global order_count, active_order, sl_hit_count, last_balance_check
-    telegram("บอททำงานแล้ว")
+    global trade_count, sl_count, active_position, last_trade_day
+
+    telegram("เริ่มทำงาน: EMA Bot (M15)")
 
     while True:
-        now = datetime.utcnow()
+        try:
+            now = datetime.utcnow()
+            today = now.date()
 
-        if (now - last_balance_check).total_seconds() >= check_balance_every_hours * 3600:
-            balance = fetch_balance()
-            telegram(f"เช็คยอด: บอทกำลังทำงาน คุณมี {balance} USDT")
-            last_balance_check = now
+            if last_trade_day != today:
+                trade_count = 0
+                sl_count = 0
+                last_trade_day = today
 
-        if last_sl_time and (now - last_sl_time).total_seconds() < cooldown_after_sl_minutes * 60:
+            if trade_count >= max_trades_per_day or sl_count >= max_sl_per_day or active_position:
+                time.sleep(60)
+                continue
+
+            signal = detect_cross()
+            if signal:
+                entry_price, direction = open_position(signal)
+                if entry_price:
+                    monitor(entry_price, direction)
+
             time.sleep(30)
-            continue
 
-        if active_order is None and order_count < 3 and sl_hit_count < 2:
-            signal = detect_ema_crossover()
-            if signal == 'golden':
-                result = open_order('long')
-            elif signal == 'death':
-                result = open_order('short')
-            else:
-                result = None
+        except Exception as e:
+            telegram(f"[ERROR LOOP] {e}")
+            time.sleep(60)
 
-            if result:
-                active_order = result
-                entry, tp, sl, direction, order_id = result
-                order_count += 1
-                monitor_trade(entry, tp, sl, direction, order_id)
-
-        elif order_count >= 3 or sl_hit_count >= 2:
-            telegram("หยุดเทรดวันนี้ (ครบ 3 ไม้ หรือ SL 2 ไม้)")
-            while datetime.utcnow().date() == now.date():
-                time.sleep(300)
-
-            # Reset ตอนข้ามวัน
-            order_count = 0
-            sl_hit_count = 0
-            last_sl_time = None
-            telegram("เริ่มวันใหม่แล้ว")
-
-        time.sleep(10)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
