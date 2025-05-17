@@ -51,24 +51,32 @@ def telegram(msg):
 def get_ohlcv():
     return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
 
-def calculate_ema(prices, period):
+def calculate_ema_series(prices, period):
     multiplier = 2 / (period + 1)
     ema = prices[0]
-    for price in prices[1:]:
+    emas = []
+    for price in prices:
         ema = (price - ema) * multiplier + ema
-    return ema
+        emas.append(ema)
+    return emas
 
 # === เช็คจุดตัด EMA ===
 def detect_cross():
     candles = get_ohlcv()
     closes = [c[4] for c in candles]
-    ema50 = calculate_ema(closes, 50)
-    ema200 = calculate_ema(closes, 200)
 
-    if ema50 > ema200:
-        return 'long'
-    elif ema50 < ema200:
-        return 'short'
+    ema50 = calculate_ema_series(closes, 50)
+    ema200 = calculate_ema_series(closes, 200)
+
+    ema50_prev = ema50[-2]
+    ema50_now = ema50[-1]
+    ema200_prev = ema200[-2]
+    ema200_now = ema200[-1]
+
+    if ema50_prev < ema200_prev and ema50_now > ema200_now:
+        return 'long'   # Golden Cross
+    elif ema50_prev > ema200_prev and ema50_now < ema200_now:
+        return 'short'  # Death Cross
     return None
 
 # === เปิดออเดอร์พร้อม TP/SL ===
@@ -77,38 +85,26 @@ def open_position(direction):
 
     price = float(exchange.fetch_ticker(symbol)['last'])
     side = 'buy' if direction == 'long' else 'sell'
-    opposite = 'sell' if side == 'buy' else 'buy'
+    posSide = 'long' if direction == 'long' else 'short'
 
     tp = price + tp_value if direction == 'long' else price - tp_value
     sl = price - sl_value if direction == 'long' else price + sl_value
 
     params = {
-    'tdMode': 'cross',
-    'ordType': 'market',
-    'lever': str(leverage)
-}
+        'tdMode': 'cross',
+        'ordType': 'market',
+        'lever': str(leverage),
+        'tpTriggerPx': tp,
+        'slTriggerPx': sl,
+        'posSide': posSide
+    }
 
     try:
         order = exchange.create_order(symbol, 'market', side, order_size, None, params)
         telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}\nSL: {sl}")
-
-        # ตั้ง TP/SL
-        tp_order = exchange.create_order(symbol, 'take_profit', opposite, order_size, tp, {
-           'tdMode': 'cross',
-           'tpTriggerPx': tp,
-           'ordType': 'limit'
-        })
-
-        sl_order = exchange.create_order(symbol, 'stop_loss', opposite, order_size, sl, {
-           'tdMode': 'cross',
-           'slTriggerPx': sl,
-           'ordType': 'market'
-        })
-
         trade_count += 1
         active_position = True
         return price, direction
-
     except Exception as e:
         telegram(f"[ERROR เปิดออเดอร์] {e}")
         return None, None
@@ -133,13 +129,15 @@ def move_sl_to_breakeven(entry_price, direction):
 def monitor(entry_price, direction):
     global active_position, sl_count
 
+    sl_moved = False
+
     while True:
         price = float(exchange.fetch_ticker(symbol)['last'])
         profit = price - entry_price if direction == 'long' else entry_price - price
 
-        if profit >= 250:
+        if not sl_moved and profit >= 250:
             move_sl_to_breakeven(entry_price, direction)
-            break
+            sl_moved = True
 
         if profit >= tp_value or profit <= -sl_value:
             telegram(f"ปิดออเดอร์ {direction.upper()} ที่ราคา {price} / กำไร: {profit:.2f}")
