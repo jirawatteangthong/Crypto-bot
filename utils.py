@@ -1,30 +1,24 @@
 import ccxt
-import time
-from config import OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSWORD, SYMBOL
+import requests
 
-def connect_okx():
-    return ccxt.okx({
-        'apiKey': OKX_API_KEY,
-        'secret': OKX_API_SECRET,
-        'password': OKX_API_PASSWORD,
-        'enableRateLimit': True,
-        'options': {'defaultType': 'future'}
-    })
+api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'
+secret = '05A665CEAF8B2161483DF63CB10085D2'
+password = 'Jirawat1-'
 
-def fetch_ohlcv(tf='5m', limit=100):
-    exchange = connect_okx()
-    raw = exchange.fetch_ohlcv(SYMBOL, timeframe=tf, limit=limit)
-    return [{'timestamp': i[0], 'open': i[1], 'high': i[2], 'low': i[3], 'close': i[4]} for i in raw]
+exchange = ccxt.okx({
+    'apiKey': api_key,
+    'secret': secret,
+    'password': password,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
 
-def fetch_current_price():
-    exchange = connect_okx()
-    ticker = exchange.fetch_ticker(SYMBOL)
-    return ticker['last']
+def fetch_candles():
+    return exchange.fetch_ohlcv('BTC/USDT:USDT', timeframe='15m', limit=210)
 
-def get_today():
-    return time.strftime('%Y-%m-%d')
+def fetch_price():
+    return float(exchange.fetch_ticker('BTC/USDT:USDT')['last'])
 
-def sleep_until_next_candle():
-    t = time.time()
-    sleep_sec = 300 - (t % 300)
-    time.sleep(sleep_sec)
+def get_balance():
+    balance = exchange.fetch_balance()
+    return balance['total']['USDT']
