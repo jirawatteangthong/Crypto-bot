@@ -83,11 +83,10 @@ def open_position(direction):
     sl = price - sl_value if direction == 'long' else price + sl_value
 
     params = {
-        'tdMode': 'cross',
-        'ordType': 'market',
-        'posSide': 'long' if direction == 'long' else 'short',
-        'lever': str(leverage)
-    }
+    'tdMode': 'cross',
+    'ordType': 'market',
+    'lever': str(leverage)
+}
 
     try:
         order = exchange.create_order(symbol, 'market', side, order_size, None, params)
@@ -95,17 +94,15 @@ def open_position(direction):
 
         # ตั้ง TP/SL
         tp_order = exchange.create_order(symbol, 'take_profit', opposite, order_size, tp, {
-            'tdMode': 'cross',
-            'posSide': params['posSide'],
-            'tpTriggerPx': tp,
-            'ordType': 'limit'
+           'tdMode': 'cross',
+           'tpTriggerPx': tp,
+           'ordType': 'limit'
         })
 
         sl_order = exchange.create_order(symbol, 'stop_loss', opposite, order_size, sl, {
-            'tdMode': 'cross',
-            'posSide': params['posSide'],
-            'slTriggerPx': sl,
-            'ordType': 'market'
+           'tdMode': 'cross',
+           'slTriggerPx': sl,
+           'ordType': 'market'
         })
 
         trade_count += 1
