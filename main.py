@@ -26,6 +26,7 @@ trade_count = 0
 sl_count = 0
 active_position = False
 last_trade_day = None
+last_check_time = datetime.utcnow()
 
 # === ตั้งค่า OKX ===
 exchange = ccxt.okx({
@@ -148,6 +149,15 @@ def monitor(entry_price, direction):
 
         time.sleep(10)
 
+# === เช็คสถานะบอททุก 5 ชั่วโมง ===
+def check_status():
+    global last_check_time
+    now = datetime.utcnow()
+    if (now - last_check_time) >= timedelta(hours=5):
+        telegram(f"บอทยังทำงานอยู่ - {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                 f"จำนวนไม้วันนี้: {trade_count} / SL: {sl_count}")
+        last_check_time = now
+
 # === MAIN LOOP ===
 def main():
     global trade_count, sl_count, active_position, last_trade_day
@@ -165,6 +175,7 @@ def main():
                 last_trade_day = today
 
             if trade_count >= max_trades_per_day or sl_count >= max_sl_per_day or active_position:
+                check_status()
                 time.sleep(60)
                 continue
 
@@ -174,6 +185,7 @@ def main():
                 if entry_price:
                     monitor(entry_price, direction)
 
+            check_status()
             time.sleep(30)
 
         except Exception as e:
