@@ -62,14 +62,12 @@ def calculate_ema(prices, period):
 def detect_cross():
     candles = get_ohlcv()
     closes = [c[4] for c in candles]
-    ema50_prev = calculate_ema(closes[:-1], 50)
-    ema200_prev = calculate_ema(closes[:-1], 200)
-    ema50_now = calculate_ema(closes, 50)
-    ema200_now = calculate_ema(closes, 200)
+    ema50 = calculate_ema(closes, 50)
+    ema200 = calculate_ema(closes, 200)
 
-    if ema50_prev < ema200_prev and ema50_now > ema200_now:
+    if ema50 > ema200:
         return 'long'
-    elif ema50_prev > ema200_prev and ema50_now < ema200_now:
+    elif ema50 < ema200:
         return 'short'
     return None
 
