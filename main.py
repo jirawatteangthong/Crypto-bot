@@ -1,143 +1,195 @@
+import ccxt
 import time
-import datetime
-from okx_trade import OKXTrade
-from strategy import calculate_ema_series
-from telegram_bot import send_telegram_message
+import requests
+from datetime import datetime, timedelta
 
-SYMBOL = "BTC-USDT-SWAP"
-LEVERAGE = 20
-ORDER_SIZE = 0.5
-TP_AMOUNT = 500
-SL_AMOUNT = 990
+# === ตั้งค่า ===
+api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'
+secret = '05A665CEAF8B2161483DF63CB10085D2'
+password = 'Jirawat1-'
 
-MAX_TRADES_PER_DAY = 3
-MAX_SL_PER_DAY = 2
+symbol = 'BTC/USDT:USDT'
+timeframe = '15m'
+order_size = 0.5
+leverage = 20
+tp_value = 500
+sl_value = 990
 
-TRADE_STATE = {
-    "today": None,
-    "count": 0,
-    "sl_count": 0,
-    "has_position": False,
-}
+telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
+telegram_chat_id = '8104629569'
 
-okx = OKXTrade()
-okx.set_leverage(SYMBOL, LEVERAGE)
+max_trades_per_day = 3
+max_sl_per_day = 2
 
-last_ping = time.time()  # เพิ่มตัวแปรเก็บเวลาสุดท้ายที่เช็คบอท
+# === ตัวแปรสถานะ ===
+trade_count = 0
+sl_count = 0
+active_position = False
+last_trade_day = None
+last_check_time = datetime.utcnow()
 
-def is_new_day():
-    today = datetime.date.today()
-    if TRADE_STATE["today"] != today:
-        TRADE_STATE["today"] = today
-        TRADE_STATE["count"] = 0
-        TRADE_STATE["sl_count"] = 0
-        TRADE_STATE["has_position"] = False
-        return True
-    return False
+# === ตั้งค่า OKX ===
+exchange = ccxt.okx({
+    'apiKey': api_key,
+    'secret': secret,
+    'password': password,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}
+})
+exchange.set_sandbox_mode(False)
 
-def detect_cross(closes):
+# === Telegram แจ้งเตือน ===
+def telegram(msg):
+    try:
+        requests.get(
+            f'https://api.telegram.org/bot{telegram_token}/sendMessage',
+            params={'chat_id': telegram_chat_id, 'text': msg}
+        )
+    except Exception as e:
+        print(f"ส่ง Telegram ไม่สำเร็จ: {e}")
+
+# === ดึงข้อมูล ===
+def get_ohlcv():
+    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+
+def calculate_ema_series(prices, period):
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    emas = []
+    for price in prices:
+        ema = (price - ema) * multiplier + ema
+        emas.append(ema)
+    return emas
+
+# === เช็คจุดตัด EMA แล้วเปิดออเดอร์ทันที ===
+def detect_cross():
+    candles = get_ohlcv()
+    closes = [c[4] for c in candles]
+
     ema50 = calculate_ema_series(closes, 50)
     ema200 = calculate_ema_series(closes, 200)
 
-    if len(ema50) < 2 or len(ema200) < 2 or ema50[-2] is None or ema200[-2] is None:
+    if len(ema50) < 2 or len(ema200) < 2:
         return None
 
-    ema50_prev = ema50[-2]
-    ema50_now = ema50[-1]
-    ema200_prev = ema200[-2]
-    ema200_now = ema200[-1]
-
-    if ema50_prev < ema200_prev and ema50_now > ema200_now:
-        return "golden"
-    elif ema50_prev > ema200_prev and ema50_now < ema200_now:
-        return "death"
+    # ตรวจจุดตัดแบบ real-time (ไม่รอแท่งปิด)
+    if ema50[-1] > ema200[-1] and ema50[-2] <= ema200[-2]:
+        return 'long'   # Golden Cross
+    elif ema50[-1] < ema200[-1] and ema50[-2] >= ema200[-2]:
+        return 'short'  # Death Cross
     return None
 
-def trade_signal():
-    candles = okx.get_candles(SYMBOL, "15m", 200)
-    closes = [float(c[4]) for c in candles]
-    return detect_cross(closes)
+# === เปิดออเดอร์พร้อม TP/SL ===
+def open_position(direction):
+    global active_position, trade_count
 
-def open_order(direction):
-    price = okx.get_last_price(SYMBOL)
-    tp = price + TP_AMOUNT if direction == "long" else price - TP_AMOUNT
-    sl = price - SL_AMOUNT if direction == "long" else price + SL_AMOUNT
-    side = "buy" if direction == "long" else "sell"
+    price = float(exchange.fetch_ticker(symbol)['last'])
+    side = 'buy' if direction == 'long' else 'sell'
+    posSide = 'long' if direction == 'long' else 'short'
 
-    order = okx.place_order(SYMBOL, ORDER_SIZE, side, tp=tp, sl=sl)
-    if order:
-        TRADE_STATE["has_position"] = True
-        TRADE_STATE["count"] += 1
-        send_telegram_message(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}, SL: {sl}")
-    else:
-        send_telegram_message("เปิดออเดอร์ไม่สำเร็จ")
+    tp = price + tp_value if direction == 'long' else price - tp_value
+    sl = price - sl_value if direction == 'long' else price + sl_value
 
-def monitor_position():
-    position = okx.get_position(SYMBOL)
-    if not position:
-        return
+    params = {
+        'tdMode': 'cross',
+        'ordType': 'market',
+        'lever': str(leverage),
+        'tpTriggerPx': tp,
+        'slTriggerPx': sl,
+        'posSide': posSide
+    }
 
-    entry = float(position["avgPx"])
-    current = okx.get_last_price(SYMBOL)
-    direction = "long" if float(position["posSide"]) == "long" else "short"
+    try:
+        order = exchange.create_order(symbol, 'market', side, order_size, None, params)
+        telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}\nSL: {sl}")
+        trade_count += 1
+        active_position = True
+        return price, direction
+    except Exception as e:
+        telegram(f"[ERROR เปิดออเดอร์] {e}")
+        return None, None
 
-    pnl = (current - entry) * LEVERAGE if direction == "long" else (entry - current) * LEVERAGE
+# === เลื่อน SL ไปกันทุน ===
+def move_sl_to_breakeven(entry_price, direction):
+    try:
+        sl = entry_price
+        side = 'sell' if direction == 'long' else 'buy'
+        posSide = 'long' if direction == 'long' else 'short'
+        exchange.create_order(symbol, 'stop_loss', side, order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'slTriggerPx': sl,
+            'ordType': 'market'
+        })
+        telegram(f"เลื่อน SL ไปที่กันทุน: {sl} ({direction})")
+    except Exception as e:
+        telegram(f"[ERROR เลื่อน SL] {e}")
 
-    # กันทุน
-    if not position.get("breakeven_moved", False):
-        if abs(current - entry) >= 250:
-            okx.move_sl_to_entry(SYMBOL, entry)
-            send_telegram_message("เลื่อน SL ไปกันทุนแล้ว")
-            position["breakeven_moved"] = True
+# === ตรวจสถานะ TP/SL ===
+def monitor(entry_price, direction):
+    global active_position, sl_count
 
-    # ปิดออเดอร์
-    if float(position["unrealizedPnl"]) >= TP_AMOUNT:
-        okx.close_position(SYMBOL)
-        send_telegram_message(f"TP ที่ราคา {current}")
-        TRADE_STATE["has_position"] = False
+    sl_moved = False
 
-    elif float(position["unrealizedPnl"]) <= -SL_AMOUNT:
-        okx.close_position(SYMBOL)
-        send_telegram_message(f"SL ที่ราคา {current}")
-        TRADE_STATE["has_position"] = False
-        TRADE_STATE["sl_count"] += 1
+    while True:
+        price = float(exchange.fetch_ticker(symbol)['last'])
+        profit = price - entry_price if direction == 'long' else entry_price - price
 
-def main_loop():
-    global last_ping
-    send_telegram_message("บอทเริ่มทำงานแล้ว")
+        if not sl_moved and profit >= 250:
+            move_sl_to_breakeven(entry_price, direction)
+            sl_moved = True
+
+        if profit >= tp_value or profit <= -sl_value:
+            telegram(f"ปิดออเดอร์ {direction.upper()} ที่ราคา {price} / กำไร: {profit:.2f}")
+            if profit < 0:
+                sl_count += 1
+            active_position = False
+            break
+
+        time.sleep(10)
+
+# === เช็คสถานะบอททุก 12 ชั่วโมง ===
+def check_status():
+    global last_check_time
+    now = datetime.utcnow()
+    if (now - last_check_time) >= timedelta(hours=12):
+        telegram(f"บอทยังทำงานอยู่ - {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                 f"จำนวนไม้วันนี้: {trade_count} / SL: {sl_count}")
+        last_check_time = now
+
+# === MAIN LOOP ===
+def main():
+    global trade_count, sl_count, active_position, last_trade_day
+
+    telegram("เริ่มทำงาน: EMA Bot (M15)")
 
     while True:
         try:
-            is_new_day()
+            now = datetime.utcnow()
+            today = now.date()
 
-            # ส่งสถานะบอททุก 5 ชั่วโมง
-            now = time.time()
-            if now - last_ping >= 5 * 60 * 60:
-                send_telegram_message(
-                    f"บอทยังทำงานอยู่ - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"จำนวนออเดอร์วันนี้: {TRADE_STATE['count']} / SL: {TRADE_STATE['sl_count']}"
-                )
-                last_ping = now
+            if last_trade_day != today:
+                trade_count = 0
+                sl_count = 0
+                last_trade_day = today
 
-            if TRADE_STATE["count"] >= MAX_TRADES_PER_DAY or TRADE_STATE["sl_count"] >= MAX_SL_PER_DAY:
+            if trade_count >= max_trades_per_day or sl_count >= max_sl_per_day or active_position:
+                check_status()
                 time.sleep(60)
                 continue
 
-            if not TRADE_STATE["has_position"]:
-                signal = trade_signal()
-                if signal == "golden":
-                    open_order("long")
-                elif signal == "death":
-                    open_order("short")
+            signal = detect_cross()
+            if signal:
+                entry_price, direction = open_position(signal)
+                if entry_price:
+                    monitor(entry_price, direction)
 
-            else:
-                monitor_position()
-
+            check_status()
             time.sleep(30)
 
         except Exception as e:
-            send_telegram_message(f"เกิดข้อผิดพลาด: {str(e)}")
+            telegram(f"[ERROR LOOP] {e}")
             time.sleep(60)
 
-if __name__ == "__main__":
-    main_loop()
+if __name__ == '__main__':
+    main()
