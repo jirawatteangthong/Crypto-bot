@@ -27,6 +27,7 @@ sl_count = 0
 active_position = False
 last_trade_day = None
 last_check_time = datetime.utcnow()
+last_signal = None
 
 # === ตั้งค่า OKX ===
 exchange = ccxt.okx({
@@ -75,12 +76,12 @@ def detect_cross():
     ema200_now = ema200[-1]
 
     if ema50_prev < ema200_prev and ema50_now > ema200_now:
-        return 'long'   # Golden Cross
+        return 'long'
     elif ema50_prev > ema200_prev and ema50_now < ema200_now:
-        return 'short'  # Death Cross
+        return 'short'
     return None
 
-# === เปิดออเดอร์พร้อมตั้ง TP/SL ===
+# === เปิดออเดอร์ + TP/SL ===
 def open_position(direction):
     global active_position, trade_count
 
@@ -88,58 +89,40 @@ def open_position(direction):
     side = 'buy' if direction == 'long' else 'sell'
     posSide = 'long' if direction == 'long' else 'short'
 
+    tp = price + tp_value if direction == 'long' else price - tp_value
+    sl = price - sl_value if direction == 'long' else price + sl_value
+
     try:
-        # 1. เปิดคำสั่ง Market
-        exchange.create_order(
-            symbol=symbol,
-            type='market',
-            side=side,
-            amount=order_size,
-            params={
-                'tdMode': 'cross',
-                'posSide': posSide,
-                'lever': str(leverage),
-            }
-        )
-        telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}")
+        # คำสั่งเข้าออเดอร์
+        exchange.create_order(symbol, 'market', side, order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'ordType': 'market',
+            'lever': leverage
+        })
 
-        # 2. ตั้ง TP
-        tp = price + tp_value if direction == 'long' else price - tp_value
-        exchange.create_order(
-            symbol=symbol,
-            type='take_profit',
-            side='sell' if direction == 'long' else 'buy',
-            amount=order_size,
-            price=None,
-            params={
-                'tdMode': 'cross',
-                'posSide': posSide,
-                'tpTriggerPx': str(tp),
-                'ordType': 'market'
-            }
-        )
+        # ตั้ง TP
+        exchange.create_order(symbol, 'conditional', 'sell' if direction == 'long' else 'buy', order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'ordType': 'conditional',
+            'triggerPx': str(tp),
+            'triggerPxType': 'last'
+        })
 
-        # 3. ตั้ง SL
-        sl = price - sl_value if direction == 'long' else price + sl_value
-        exchange.create_order(
-            symbol=symbol,
-            type='stop_loss',
-            side='sell' if direction == 'long' else 'buy',
-            amount=order_size,
-            price=None,
-            params={
-                'tdMode': 'cross',
-                'posSide': posSide,
-                'slTriggerPx': str(sl),
-                'ordType': 'market'
-            }
-        )
+        # ตั้ง SL
+        exchange.create_order(symbol, 'conditional', 'sell' if direction == 'long' else 'buy', order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'ordType': 'conditional',
+            'triggerPx': str(sl),
+            'triggerPxType': 'last'
+        })
 
-        telegram(f"ตั้ง TP: {tp} | SL: {sl}")
+        telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}\nSL: {sl}")
         trade_count += 1
         active_position = True
         return price, direction
-
     except Exception as e:
         telegram(f"[ERROR เปิดออเดอร์] {e}")
         return None, None
@@ -150,19 +133,14 @@ def move_sl_to_breakeven(entry_price, direction):
         sl = entry_price
         side = 'sell' if direction == 'long' else 'buy'
         posSide = 'long' if direction == 'long' else 'short'
-        exchange.create_order(
-            symbol=symbol,
-            type='stop_loss',
-            side=side,
-            amount=order_size,
-            price=None,
-            params={
-                'tdMode': 'cross',
-                'posSide': posSide,
-                'slTriggerPx': str(sl),
-                'ordType': 'market'
-            }
-        )
+
+        exchange.create_order(symbol, 'conditional', side, order_size, None, {
+            'tdMode': 'cross',
+            'posSide': posSide,
+            'ordType': 'conditional',
+            'triggerPx': str(sl),
+            'triggerPxType': 'last'
+        })
         telegram(f"เลื่อน SL ไปที่กันทุน: {sl} ({direction})")
     except Exception as e:
         telegram(f"[ERROR เลื่อน SL] {e}")
@@ -177,7 +155,7 @@ def monitor(entry_price, direction):
         price = float(exchange.fetch_ticker(symbol)['last'])
         profit = price - entry_price if direction == 'long' else entry_price - price
 
-        if not sl_moved and profit >= 250:
+        if not sl_moved and profit >= 990:
             move_sl_to_breakeven(entry_price, direction)
             sl_moved = True
 
@@ -190,7 +168,7 @@ def monitor(entry_price, direction):
 
         time.sleep(10)
 
-# === แจ้งสถานะบอททุก 12 ชม. ===
+# === เช็คสถานะบอททุก 12 ชั่วโมง ===
 def check_status():
     global last_check_time
     now = datetime.utcnow()
@@ -201,7 +179,7 @@ def check_status():
 
 # === MAIN LOOP ===
 def main():
-    global trade_count, sl_count, active_position, last_trade_day
+    global trade_count, sl_count, active_position, last_trade_day, last_signal
 
     telegram("เริ่มทำงาน: EMA Bot (M15)")
 
@@ -221,7 +199,8 @@ def main():
                 continue
 
             signal = detect_cross()
-            if signal:
+            if signal and signal != last_signal:
+                last_signal = signal
                 entry_price, direction = open_position(signal)
                 if entry_price:
                     monitor(entry_price, direction)
