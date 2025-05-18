@@ -13,7 +13,7 @@ timeframe = '15m'
 order_size = 0.5
 leverage = 20
 tp_value = 500
-sl_value = 250
+sl_value = 990
 
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
 telegram_chat_id = '8104629569'
@@ -136,7 +136,7 @@ def monitor(entry_price, direction):
         price = float(exchange.fetch_ticker(symbol)['last'])
         profit = price - entry_price if direction == 'long' else entry_price - price
 
-        if not sl_moved and profit >= 250:
+        if not sl_moved and profit >= 990:
             move_sl_to_breakeven(entry_price, direction)
             sl_moved = True
 
@@ -153,7 +153,7 @@ def monitor(entry_price, direction):
 def check_status():
     global last_check_time
     now = datetime.utcnow()
-    if (now - last_check_time) >= timedelta(hours=5):
+    if (now - last_check_time) >= timedelta(hours=12):
         telegram(f"บอทยังทำงานอยู่ - {now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
                  f"จำนวนไม้วันนี้: {trade_count} / SL: {sl_count}")
         last_check_time = now
