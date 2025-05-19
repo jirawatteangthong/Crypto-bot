@@ -80,7 +80,7 @@ def detect_cross():
         return 'short'  # Death Cross
     return None
 
-# === เปิดออเดอร์ทันที พร้อมตั้ง TP/SL ===
+# === เปิดออเดอร์พร้อม TP/SL ===
 def open_position(direction):
     global active_position, trade_count
 
@@ -91,27 +91,26 @@ def open_position(direction):
     sl = price - sl_value if direction == 'long' else price + sl_value
 
     try:
-        # เข้าออเดอร์ทันที
-        order = exchange.create_order(symbol, 'market', side, order_size, None, {
+        # ส่งคำสั่งหลัก
+        exchange.create_order(symbol, 'market', side, order_size, None, {
             'tdMode': 'cross',
-            'ordType': 'market',
-            'lever': str(leverage)
+            'lever': str(leverage),
         })
 
         # ตั้ง TP
-        exchange.create_order(symbol, 'conditional', 'sell' if direction == 'long' else 'buy', order_size, None, {
+        exchange.create_order(symbol, 'limit', 'sell' if direction == 'long' else 'buy', order_size, None, {
             'tdMode': 'cross',
-            'ordType': 'conditional',
-            'triggerPx': str(tp),
-            'triggerPxType': 'last'
+            'tpTriggerPx': str(tp),
+            'tpOrdPx': str(tp),
+            'ordType': 'limit'
         })
 
         # ตั้ง SL
-        exchange.create_order(symbol, 'conditional', 'sell' if direction == 'long' else 'buy', order_size, None, {
+        exchange.create_order(symbol, 'limit', 'sell' if direction == 'long' else 'buy', order_size, None, {
             'tdMode': 'cross',
-            'ordType': 'conditional',
-            'triggerPx': str(sl),
-            'triggerPxType': 'last'
+            'slTriggerPx': str(sl),
+            'slOrdPx': str(sl),
+            'ordType': 'limit'
         })
 
         telegram(f"เปิดออเดอร์ {direction.upper()} ที่ราคา {price}\nTP: {tp}\nSL: {sl}")
@@ -127,11 +126,11 @@ def open_position(direction):
 def move_sl_to_breakeven(entry_price, direction):
     try:
         sl = entry_price
-        side = 'sell' if direction == 'long' else 'buy'
-        exchange.create_order(symbol, 'stop_loss', side, order_size, None, {
+        exchange.create_order(symbol, 'limit', 'sell' if direction == 'long' else 'buy', order_size, None, {
             'tdMode': 'cross',
-            'slTriggerPx': sl,
-            'ordType': 'market'
+            'slTriggerPx': str(sl),
+            'slOrdPx': str(sl),
+            'ordType': 'limit'
         })
         telegram(f"เลื่อน SL ไปที่กันทุน: {sl} ({direction})")
     except Exception as e:
