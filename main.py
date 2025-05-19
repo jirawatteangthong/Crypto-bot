@@ -10,7 +10,7 @@ password = 'Jirawat1-'
 
 symbol = 'BTC/USDT:USDT'
 timeframe = '15m'
-order_size = 0.5
+order_size = 0.3
 leverage = 20
 tp_value = 500
 sl_value = 990
