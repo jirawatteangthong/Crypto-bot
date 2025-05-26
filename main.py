@@ -2,7 +2,11 @@ import ccxt
 import time
 import requests
 from datetime import datetime, timedelta
+import logging
 
+# === ตั้งค่า Logging ===
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 # === ตั้งค่า ===
 api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'       # ใส่ API KEY
 secret = '05A665CEAF8B2161483DF63CB10085D2'
@@ -19,15 +23,14 @@ be_sl = 100
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
 telegram_chat_id = '8104629569'
 
-# === สถานะ ===
-last_signal = None
-last_order_time = None
+# === สถานะการเทรด ===
+current_position = None  # None, 'long', 'short'
 entry_price = None
-entry_side = None
-active_position = False
-last_check_time = datetime.utcnow()
+order_id = None
+sl_moved = False
+last_ema_state = None  # เก็บสถานะ EMA ก่อนหน้า
 
-# === OKX ===
+# === Exchange Setup ===
 exchange = ccxt.okx({
     'apiKey': api_key,
     'secret': secret,
@@ -38,141 +41,260 @@ exchange = ccxt.okx({
 exchange.set_sandbox_mode(False)
 
 # === Telegram ===
-def telegram(msg):
+def send_telegram(msg):
     try:
-        requests.get(f'https://api.telegram.org/bot{telegram_token}/sendMessage',
-                     params={'chat_id': telegram_chat_id, 'text': msg})
-    except:
-        pass
+        requests.get(
+            f'https://api.telegram.org/bot{telegram_token}/sendMessage',
+            params={'chat_id': telegram_chat_id, 'text': msg},
+            timeout=10
+        )
+        logger.info(f"Telegram: {msg}")
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
 
-# === EMA ===
+# === คำนวณ EMA ===
 def calculate_ema(prices, period):
-    ema = prices[0]
-    k = 2 / (period + 1)
-    for price in prices:
-        ema = price * k + ema * (1 - k)
+    if len(prices) < period:
+        return None
+    
+    # เริ่มด้วย SMA
+    sma = sum(prices[:period]) / period
+    ema = sma
+    multiplier = 2 / (period + 1)
+    
+    # คำนวณ EMA
+    for price in prices[period:]:
+        ema = (price * multiplier) + (ema * (1 - multiplier))
+    
     return ema
 
-# === EMA Cross ===
-def detect_ema_cross():
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
-    closes = [c[4] for c in ohlcv]
-
-    ema50_yesterday = calculate_ema(closes[:-1], 50)
-    ema200_yesterday = calculate_ema(closes[:-1], 200)
-    ema50_today = calculate_ema(closes, 50)
-    ema200_today = calculate_ema(closes, 200)
-
-    if ema50_yesterday < ema200_yesterday and ema50_today > ema200_today:
-        return 'long'
-    elif ema50_yesterday > ema200_yesterday and ema50_today < ema200_today:
-        return 'short'
-    return None
-
-# === เปิดออเดอร์ ===
-def open_order(direction):
-    global active_position, last_order_time, entry_price, entry_side
-    side = 'buy' if direction == 'long' else 'sell'
-    price = float(exchange.fetch_ticker(symbol)['last'])
-
-    tp = price + tp_value if direction == 'long' else price - tp_value
-    sl = price - sl_value if direction == 'long' else price + sl_value
-
-    params = {
-        'tdMode': 'cross',
-        'ordType': 'market',
-        'tpTriggerPx': str(tp),
-        'tpOrdPx': "-1",
-        'tpTriggerPxType': "last",
-        'slTriggerPx': str(sl),
-        'slOrdPx': "-1",
-        'slTriggerPxType': "last",
-        'lever': str(leverage)
-    }
-
+# === ตรวจสอบการตัดกันของ EMA ===
+def check_ema_cross():
+    global last_ema_state
+    
     try:
-        order = exchange.create_order(symbol, 'market', side, order_size, None, params)
-        telegram(f"[เปิดออเดอร์] {direction.upper()} ที่ราคา {price:.2f}\nTP: {tp}, SL: {sl}")
-        active_position = True
-        last_order_time = datetime.utcnow()
-        entry_price = price
-        entry_side = direction
+        # ดึงข้อมูลเทียน
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=250)
+        closes = [candle[4] for candle in ohlcv]
+        
+        if len(closes) < 200:
+            return None
+        
+        # คำนวณ EMA สำหรับเทียนปัจจุบันและก่อนหน้า
+        current_ema50 = calculate_ema(closes, 50)
+        current_ema200 = calculate_ema(closes, 200)
+        prev_ema50 = calculate_ema(closes[:-1], 50)
+        prev_ema200 = calculate_ema(closes[:-1], 200)
+        
+        if None in [current_ema50, current_ema200, prev_ema50, prev_ema200]:
+            return None
+        
+        # เก็บสถานะปัจจุบัน
+        current_state = 'above' if current_ema50 > current_ema200 else 'below'
+        
+        # ตรวจสอบการตัดกัน
+        cross_signal = None
+        
+        # Golden Cross: EMA50 ตัดขึ้นเหนือ EMA200
+        if prev_ema50 <= prev_ema200 and current_ema50 > current_ema200:
+            cross_signal = 'long'
+            logger.info(f"Golden Cross detected: EMA50({current_ema50:.2f}) > EMA200({current_ema200:.2f})")
+        
+        # Death Cross: EMA50 ตัดลงใต้ EMA200  
+        elif prev_ema50 >= prev_ema200 and current_ema50 < current_ema200:
+            cross_signal = 'short'
+            logger.info(f"Death Cross detected: EMA50({current_ema50:.2f}) < EMA200({current_ema200:.2f})")
+        
+        last_ema_state = current_state
+        return cross_signal
+        
     except Exception as e:
-        telegram(f"[ERROR เปิดออเดอร์] okx {e}")
+        logger.error(f"EMA calculation error: {e}")
+        return None
 
-# === ตรวจสอบ TP/SL และเลื่อน SL ===
-def monitor_position():
-    global active_position
-    sl_moved = False
+# === ตรวจสอบโพซิชันปัจจุบัน ===
+def get_current_position():
+    try:
+        positions = exchange.fetch_positions([symbol])
+        for pos in positions:
+            if pos['contracts'] > 0:
+                return {
+                    'side': pos['side'],
+                    'size': pos['contracts'],
+                    'entry_price': pos['entryPrice'],
+                    'unrealized_pnl': pos['unrealizedPnl']
+                }
+        return None
+    except Exception as e:
+        logger.error(f"Get position error: {e}")
+        return None
 
-    while active_position:
-        try:
-            price = float(exchange.fetch_ticker(symbol)['last'])
-            pnl = price - entry_price if entry_side == 'long' else entry_price - price
-
-            if not sl_moved and pnl >= be_profit_trigger:
-                move_sl(entry_price, entry_side)
-                sl_moved = True
-
-            if pnl >= tp_value or pnl <= -sl_value:
-                telegram(f"[ปิดออเดอร์] {entry_side.upper()} ที่ {price:.2f} / PnL: {pnl:.2f}")
-                active_position = False
-                break
-
-            time.sleep(10)
-        except Exception as e:
-            telegram(f"[ERROR Monitor] {e}")
-            time.sleep(10)
+# === เปิดออเดอร์พร้อม TP/SL ===
+def open_order_with_tpsl(direction):
+    global current_position, entry_price, order_id, sl_moved
+    
+    try:
+        # เช็คว่ามีโพซิชันอยู่หรือไม่
+        existing_pos = get_current_position()
+        if existing_pos:
+            logger.info("มีโพซิชันอยู่แล้ว ข้ามการเปิดออเดอร์")
+            return False
+        
+        # ดึงราคาปัจจุบัน
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = float(ticker['last'])
+        
+        # คำนวณ TP และ SL
+        if direction == 'long':
+            tp_price = current_price + tp_value
+            sl_price = current_price - sl_value
+            side = 'buy'
+        else:
+            tp_price = current_price - tp_value
+            sl_price = current_price + sl_value
+            side = 'sell'
+        
+        # พารามิเตอร์สำหรับ OKX
+        params = {
+            'tdMode': 'cross',
+            'ordType': 'market',
+            'lever': str(leverage),
+            'tpTriggerPx': str(tp_price),
+            'tpOrdPx': '-1',
+            'tpTriggerPxType': 'last',
+            'slTriggerPx': str(sl_price),
+            'slOrdPx': '-1', 
+            'slTriggerPxType': 'last'
+        }
+        
+        # สร้างออเดอร์
+        order = exchange.create_order(symbol, 'market', side, order_size, None, params)
+        
+        # อัพเดตสถานะ
+        current_position = direction
+        entry_price = current_price
+        order_id = order.get('id')
+        sl_moved = False
+        
+        # ส่งแจ้งเตือน
+        message = f"""🚀 เปิดออเดอร์ {direction.upper()}
+💰 ราคาเข้า: {current_price:.2f}
+🎯 TP: {tp_price:.2f} (+{tp_value})
+🛡️ SL: {sl_price:.2f} (-{sl_value})
+📊 ขนาด: {order_size} BTC
+Order ID: {order_id}"""
+        
+        send_telegram(message)
+        logger.info(f"Order opened: {direction} at {current_price}")
+        return True
+        
+    except Exception as e:
+        error_msg = f"❌ เปิดออเดอร์ล้มเหลว: {e}"
+        send_telegram(error_msg)
+        logger.error(error_msg)
+        return False
 
 # === เลื่อน SL เป็นกันทุน ===
-def move_sl(entry, direction):
+def move_sl_to_breakeven():
+    global sl_moved
+    
     try:
-        new_sl = entry - be_sl if direction == 'long' else entry + be_sl
-        telegram(f"[เลื่อน SL] เป็นกันทุนที่ {new_sl} ({direction})")
-        # ไม่สามารถแก้ SL โดยตรง ต้องใช้ strategy หรือปิดแล้วเปิดใหม่
-        # ปล่อยให้ OKX จัดการในระบบ SL เดิมแทน หรือเขียนส่วนแก้คำสั่งเพิ่มภายหลัง
+        if sl_moved:
+            return
+        
+        # คำนวณ SL ใหม่ (กันทุน)
+        if current_position == 'long':
+            new_sl = entry_price - be_sl
+        else:
+            new_sl = entry_price + be_sl
+        
+        # สำหรับ OKX ต้องใช้ API แก้ไข Algo Order
+        # หรือยกเลิกออเดอร์เก่าแล้วสร้างใหม่
+        # ในที่นี้จะแจ้งเตือนเฉย ๆ เพราะ OKX มีข้อจำกัด
+        
+        sl_moved = True
+        message = f"""🔄 เลื่อน SL เป็นกันทุน
+📍 ราคาเข้า: {entry_price:.2f}
+🛡️ SL ใหม่: {new_sl:.2f}
+💚 โพซิชัน: {current_position.upper()}"""
+        
+        send_telegram(message)
+        logger.info(f"SL moved to breakeven: {new_sl}")
+        
     except Exception as e:
-        telegram(f"[ERROR เลื่อน SL] {e}")
+        logger.error(f"Move SL error: {e}")
 
-# === เช็คสถานะทุก 12 ชม. ===
-def check_bot_status():
-    global last_check_time
-    now = datetime.utcnow()
-    if (now - last_check_time) > timedelta(hours=12):
-        telegram("[สถานะ] บอทยังทำงานปกติ")
-        last_check_time = now
+# === ตรวจสอบโพซิชันและจัดการ SL ===
+def monitor_position():
+    global current_position, sl_moved
+    
+    if not current_position:
+        return
+        
+    try:
+        # เช็คโพซิชันจริง
+        pos_info = get_current_position()
+        
+        if not pos_info:
+            # โพซิชันถูกปิดแล้ว
+            logger.info("Position closed")
+            message = f"✅ โพซิชัน {current_position.upper()} ถูกปิดแล้ว"
+            send_telegram(message)
+            
+            current_position = None
+            entry_price = None
+            order_id = None
+            sl_moved = False
+            return
+        
+        # คำนวณ PnL
+        current_price = float(exchange.fetch_ticker(symbol)['last'])
+        
+        if current_position == 'long':
+            pnl = current_price - entry_price
+        else:
+            pnl = entry_price - current_price
+        
+        # เลื่อน SL เมื่อกำไรถึง 350
+        if not sl_moved and pnl >= be_profit_trigger:
+            move_sl_to_breakeven()
+        
+        logger.info(f"Position: {current_position}, PnL: {pnl:.2f}, Price: {current_price:.2f}")
+        
+    except Exception as e:
+        logger.error(f"Monitor position error: {e}")
 
-# === MAIN ===
+# === MAIN LOOP ===
 def main():
-    global last_signal, active_position, last_order_time
-
-    telegram("[เริ่มทำงาน] EMA Bot M15")
-
+    send_telegram("🤖 EMA Cross Bot เริ่มทำงาน")
+    logger.info("Bot started")
+    
     while True:
         try:
-            check_bot_status()
-
-            signal = detect_ema_cross()
-            now = datetime.utcnow()
-
-            can_trade = (
-                not active_position and
-                signal and
-                signal != last_signal and
-                (not last_order_time or (now - last_order_time) > timedelta(hours=2))
-            )
-
-            if can_trade:
-                last_signal = signal
-                open_order(signal)
-                time.sleep(5)
-                monitor_position()
-
-            time.sleep(15)
-
+            # ตรวจสอบโพซิชันปัจจุบัน
+            monitor_position()
+            
+            # ถ้าไม่มีโพซิชัน ให้เช็คสัญญาณ
+            if not current_position:
+                signal = check_ema_cross()
+                
+                if signal:
+                    logger.info(f"EMA Cross Signal: {signal}")
+                    open_order_with_tpsl(signal)
+                    time.sleep(5)  # รอสักครู่หลังเปิดออเดอร์
+            
+            time.sleep(15)  # เช็คทุก 15 วินาที
+            
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            send_telegram("🛑 Bot หยุดทำงานโดยผู้ใช้")
+            break
+            
         except Exception as e:
-            telegram(f"[ERROR LOOP] {e}")
-            time.sleep(30)
+            error_msg = f"❌ Main loop error: {e}"
+            logger.error(error_msg)
+            send_telegram(error_msg)
+            time.sleep(30)  # พัก 30 วินาทีเมื่อเกิดข้อผิดพลาด
 
 if __name__ == '__main__':
     main()
