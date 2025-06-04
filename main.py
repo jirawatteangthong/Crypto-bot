@@ -23,6 +23,9 @@ sl_value = 990
 be_profit_trigger = 350
 be_sl = 100
 
+# === ตั้งค่าการจัดการทุน ===
+CAPITAL_USAGE_PERCENT = 0.5  # ใช้ 50% ของยอดคงเหลือปัจจุบันในการเปิดออเดอร์แต่ละไม้
+
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
 telegram_chat_id = '8104629569'
 
@@ -218,7 +221,7 @@ def get_current_position():
         send_telegram(f"⛔️ Error: ไม่สามารถดึงข้อมูลโพซิชันได้\nรายละเอียด: {e}")
         return None
 
-# === เปิดออเดอร์พร้อม TP/SL (ใช้ 50% ของพอร์ต) ===
+# === เปิดออเดอร์พร้อม TP/SL (ใช้ 50% ของยอดคงเหลือปัจจุบัน) ===
 def open_order_with_tpsl(direction):
     global current_position, entry_price, order_id, sl_moved
     
@@ -229,14 +232,14 @@ def open_order_with_tpsl(direction):
             logger.info("มีโพซิชันอยู่แล้ว ข้ามการเปิดออเดอร์")
             return False
         
-        # ดึงยอดคงเหลือ
+        # ดึงยอดคงเหลือปัจจุบัน
         balance = get_portfolio_balance()
         if balance <= 0:
             send_telegram("⛔️ Error: ไม่สามารถดึงยอดคงเหลือได้")
             return False
         
-        # คำนวณขนาดออเดอร์ (50% ของพอร์ต)
-        use_balance = balance * 0.5  # ใช้ 50% ของพอร์ต
+        # คำนวณทุนที่จะใช้ (50% ของยอดคงเหลือปัจจุบัน)
+        use_balance = balance * CAPITAL_USAGE_PERCENT
         
         # ดึงราคาปัจจุบัน
         ticker = exchange.fetch_ticker(symbol)
@@ -286,10 +289,11 @@ Entry: {current_price:,.0f}
 TP: {tp_price:,.0f}
 SL: {sl_price:,.0f}
 💰 ใช้เงิน: {use_balance:,.1f} USDT ({leverage}x)
+💼 จากยอดคงเหลือ: {balance:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
 📊 ขนาด: {order_size:.6f} BTC"""
         
         send_telegram(message)
-        logger.info(f"Order opened: {direction} at {current_price}, size: {order_size}")
+        logger.info(f"Order opened: {direction} at {current_price}, size: {order_size}, capital used: {use_balance} from balance: {balance}")
         return True
         
     except Exception as e:
@@ -362,21 +366,26 @@ def monitor_position():
                     close_reason = "บังคับปิด"
                     emoji = "🔄"
             
-            # คำนวณ PnL ใน USDT (ประมาณการ)
-            position_value = (portfolio_balance * 0.5 * leverage) / entry_price
+            # คำนวณ PnL ใน USDT (ใช้ยอดคงเหลือปัจจุบัน)
+            current_balance = get_portfolio_balance()
+            use_balance = current_balance * CAPITAL_USAGE_PERCENT
+            position_value = (use_balance * leverage) / entry_price
             pnl_usdt = pnl_points * position_value
             
             # ส่งข้อความแจ้งเตือน
             if close_reason in ["TP", "SL"]:
                 if pnl_usdt > 0:
                     message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-กำไร: +{abs(pnl_usdt):,.0f} USDT"""
+กำไร: +{abs(pnl_usdt):,.0f} USDT
+💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
                 else:
                     message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-ขาดทุน: {pnl_usdt:,.0f} USDT"""
+ขาดทุน: {pnl_usdt:,.0f} USDT
+💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
             else:
                 message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-P&L: {pnl_usdt:,.0f} USDT"""
+P&L: {pnl_usdt:,.0f} USDT
+💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
             
             send_telegram(message)
             logger.info(f"Position closed: {close_reason}, PnL: {pnl_usdt:.2f}")
@@ -442,6 +451,7 @@ def daily_report():
 🔹 SL: {sl_count} ครั้ง
 🔹 TP: {tp_count} ครั้ง
 🔹 คงเหลือ: {balance:,.1f} USDT
+🔹 ทุนต่อเทรดถัดไป: {balance * CAPITAL_USAGE_PERCENT:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
 ⏱ บอทยังทำงานปกติ ✅
 วันที่: {now.strftime('%d/%m/%Y %H:%M')}"""
         
@@ -472,15 +482,16 @@ def send_startup_message():
         
         message = f"""🔄 บอทเริ่มทำงาน
 🤖 EMA Cross Trading Bot
-💰 ยอดเริ่มต้น: {initial_balance:,.1f} USDT
+💼 ยอดคงเหลือ: {initial_balance:,.1f} USDT
+💰 ทุนต่อเทรดแรก: {initial_balance * CAPITAL_USAGE_PERCENT:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
 ⏰ เวลาเริ่ม: {startup_time}
 📊 เฟรม: {timeframe} | Leverage: {leverage}x
 🎯 TP: {tp_value} | SL: {sl_value}
-🔧 ใช้เงิน: 50% ต่อออเดอร์
+🔧 ใช้เงิน: {CAPITAL_USAGE_PERCENT*100:.0f}% ของยอดคงเหลือปัจจุบัน
 📈 รอสัญญาณ EMA Cross..."""
         
         send_telegram(message)
-        logger.info("Startup message sent")
+        logger.info(f"Startup message sent - Using {CAPITAL_USAGE_PERCENT*100:.0f}% of current balance per trade")
         
     except Exception as e:
         logger.error(f"Startup message error: {e}")
