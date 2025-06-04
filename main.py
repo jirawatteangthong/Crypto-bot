@@ -27,7 +27,7 @@ be_sl = 100
 CAPITAL_USAGE_PERCENT = 0.5  # ใช้ 50% ของยอดคงเหลือปัจจุบันในการเปิดออเดอร์แต่ละไม้
 
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
-telegram_chat_id = '8104629569'
+telegram_chat_id = '8104629569
 
 # === ไฟล์เก็บข้อมูล ===
 STATS_FILE = 'trading_stats.json'
