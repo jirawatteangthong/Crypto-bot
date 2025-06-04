@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # === ตั้งค่า ===
 api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'       # ใส่ API KEY
 secret = '05A665CEAF8B2161483DF63CB10085D2'  # ใส่ secret ของคุณ
-password = 'Ji'  # ใส่ password ของคุณ
+password = 'Jirawat1-'  # ใส่ password ของคุณ
 symbol = 'BTC/USDT:USDT'
 timeframe = '15m'
 leverage = 20
@@ -24,10 +24,10 @@ be_profit_trigger = 350
 be_sl = 100
 
 # === ตั้งค่าการจัดการทุน ===
-CAPITAL_USAGE_PERCENT = 0.5  # ใช้ 50% ของยอดคงเหลือปัจจุบันในการเปิดออเดอร์แต่ละไม้
+CAPITAL_USAGE_PERCENT = 0.8  # ใช้ 50% ของยอดคงเหลือปัจจุบันในการเปิดออเดอร์แต่ละไม้
 
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
-telegram_chat_id = '8104629569
+telegram_chat_id = '8104629569'
 
 # === ไฟล์เก็บข้อมูล ===
 STATS_FILE = 'trading_stats.json'
