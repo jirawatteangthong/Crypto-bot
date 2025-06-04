@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # === ตั้งค่า ===
 api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'       # ใส่ API KEY
 secret = '05A665CEAF8B2161483DF63CB10085D2'  # ใส่ secret ของคุณ
-password = 'Jirawat1-'  # ใส่ password ของคุณ
+password = 'Ji'  # ใส่ password ของคุณ
 symbol = 'BTC/USDT:USDT'
 timeframe = '15m'
 leverage = 20
