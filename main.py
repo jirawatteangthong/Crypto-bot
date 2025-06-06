@@ -4,8 +4,6 @@ import requests
 from datetime import datetime, timedelta
 import logging
 import threading
-import json
-import os
 
 # === ตั้งค่า Logging ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,14 +21,8 @@ sl_value = 990
 be_profit_trigger = 350
 be_sl = 100
 
-# === ตั้งค่าการจัดการทุน ===
-CAPITAL_USAGE_PERCENT = 0.8  # ใช้ 50% ของยอดคงเหลือปัจจุบันในการเปิดออเดอร์แต่ละไม้
-
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
 telegram_chat_id = '8104629569'
-
-# === ไฟล์เก็บข้อมูล ===
-STATS_FILE = 'trading_stats.json'
 
 # === สถานะการเทรด ===
 current_position = None  # None, 'long', 'short'
@@ -40,16 +32,6 @@ sl_moved = False
 last_ema_state = None
 portfolio_balance = 0
 last_daily_report = None
-initial_balance = 0
-
-# === สถิติการเทรด ===
-daily_stats = {
-    'date': None,
-    'tp_count': 0,
-    'sl_count': 0,
-    'total_pnl': 0,
-    'trades': []
-}
 
 # === Exchange Setup ===
 exchange = ccxt.okx({
@@ -60,65 +42,6 @@ exchange = ccxt.okx({
     'options': {'defaultType': 'swap'}
 })
 exchange.set_sandbox_mode(False)
-
-# === บันทึกสถิติ ===
-def load_daily_stats():
-    global daily_stats
-    try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, 'r') as f:
-                daily_stats = json.load(f)
-    except Exception as e:
-        logger.error(f"Load stats error: {e}")
-        daily_stats = {
-            'date': None,
-            'tp_count': 0,
-            'sl_count': 0,
-            'total_pnl': 0,
-            'trades': []
-        }
-
-def save_daily_stats():
-    try:
-        with open(STATS_FILE, 'w') as f:
-            json.dump(daily_stats, f)
-    except Exception as e:
-        logger.error(f"Save stats error: {e}")
-
-def reset_daily_stats():
-    global daily_stats
-    daily_stats = {
-        'date': datetime.now().strftime('%Y-%m-%d'),
-        'tp_count': 0,
-        'sl_count': 0,
-        'total_pnl': 0,
-        'trades': []
-    }
-    save_daily_stats()
-
-def add_trade_result(close_type, pnl_usdt):
-    global daily_stats
-    
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    # เช็คว่าเป็นวันใหม่หรือไม่
-    if daily_stats['date'] != today:
-        reset_daily_stats()
-    
-    # เพิ่มข้อมูลการเทรด
-    if close_type == 'TP':
-        daily_stats['tp_count'] += 1
-    elif close_type == 'SL':
-        daily_stats['sl_count'] += 1
-    
-    daily_stats['total_pnl'] += pnl_usdt
-    daily_stats['trades'].append({
-        'time': datetime.now().strftime('%H:%M:%S'),
-        'type': close_type,
-        'pnl': pnl_usdt
-    })
-    
-    save_daily_stats()
 
 # === Telegram ===
 def send_telegram(msg):
@@ -131,6 +54,7 @@ def send_telegram(msg):
         logger.info(f"Telegram: {msg}")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
+        # แจ้งเตือน Error การส่ง Telegram
         logger.error("⛔️ Error: ไม่สามารถส่งข้อความ Telegram ได้")
 
 # === ดึงยอดคงเหลือ ===
@@ -162,7 +86,7 @@ def calculate_ema(prices, period):
     
     return ema
 
-# === ตรวจสอบการตัดกันของ EMA (เร็วที่สุด - เช็ค 1-2 เทียน) ===
+# === ตรวจสอบการตัดกันของ EMA (เร็วขึ้น) ===
 def check_ema_cross():
     global last_ema_state
     
@@ -174,27 +98,33 @@ def check_ema_cross():
         if len(closes) < 200:
             return None
         
-        # คำนวณ EMA สำหรับ 2 เทียนล่าสุด (เร็วที่สุด)
+        # คำนวณ EMA สำหรับ 3 เทียนล่าสุด (เพื่อให้เร็วขึ้น)
         current_ema50 = calculate_ema(closes, 50)
         current_ema200 = calculate_ema(closes, 200)
         prev_ema50 = calculate_ema(closes[:-1], 50)
         prev_ema200 = calculate_ema(closes[:-1], 200)
+        prev2_ema50 = calculate_ema(closes[:-2], 50)
+        prev2_ema200 = calculate_ema(closes[:-2], 200)
         
-        if None in [current_ema50, current_ema200, prev_ema50, prev_ema200]:
+        if None in [current_ema50, current_ema200, prev_ema50, prev_ema200, prev2_ema50, prev2_ema200]:
             return None
         
-        # ตรวจสอบการตัดกันแบบเร็วที่สุด (ตัดในเทียนล่าสุด)
+        # ตรวจสอบการตัดกันแบบเร็ว (ไม่รอให้ตัดชัดเจน)
         cross_signal = None
         
-        # Golden Cross: EMA50 ตัดขึ้นเหนือ EMA200 ในเทียนล่าสุด
-        if prev_ema50 <= prev_ema200 and current_ema50 > current_ema200:
+        # Golden Cross: EMA50 กำลังตัดขึ้นเหนือ EMA200
+        if (prev2_ema50 <= prev2_ema200 and 
+            prev_ema50 >= prev_ema200 and 
+            current_ema50 > current_ema200):
             cross_signal = 'long'
-            logger.info(f"Golden Cross detected (Ultra Fast): EMA50({current_ema50:.2f}) > EMA200({current_ema200:.2f})")
+            logger.info(f"Golden Cross detected (Fast): EMA50({current_ema50:.2f}) > EMA200({current_ema200:.2f})")
         
-        # Death Cross: EMA50 ตัดลงใต้ EMA200 ในเทียนล่าสุด
-        elif prev_ema50 >= prev_ema200 and current_ema50 < current_ema200:
+        # Death Cross: EMA50 กำลังตัดลงใต้ EMA200
+        elif (prev2_ema50 >= prev2_ema200 and 
+              prev_ema50 <= prev_ema200 and 
+              current_ema50 < current_ema200):
             cross_signal = 'short'
-            logger.info(f"Death Cross detected (Ultra Fast): EMA50({current_ema50:.2f}) < EMA200({current_ema200:.2f})")
+            logger.info(f"Death Cross detected (Fast): EMA50({current_ema50:.2f}) < EMA200({current_ema200:.2f})")
         
         return cross_signal
         
@@ -221,7 +151,7 @@ def get_current_position():
         send_telegram(f"⛔️ Error: ไม่สามารถดึงข้อมูลโพซิชันได้\nรายละเอียด: {e}")
         return None
 
-# === เปิดออเดอร์พร้อม TP/SL (ใช้ 50% ของยอดคงเหลือปัจจุบัน) ===
+# === เปิดออเดอร์พร้อม TP/SL (ใช้ 50% ของพอร์ต) ===
 def open_order_with_tpsl(direction):
     global current_position, entry_price, order_id, sl_moved
     
@@ -232,14 +162,14 @@ def open_order_with_tpsl(direction):
             logger.info("มีโพซิชันอยู่แล้ว ข้ามการเปิดออเดอร์")
             return False
         
-        # ดึงยอดคงเหลือปัจจุบัน
+        # ดึงยอดคงเหลือ
         balance = get_portfolio_balance()
         if balance <= 0:
             send_telegram("⛔️ Error: ไม่สามารถดึงยอดคงเหลือได้")
             return False
         
-        # คำนวณทุนที่จะใช้ (50% ของยอดคงเหลือปัจจุบัน)
-        use_balance = balance * CAPITAL_USAGE_PERCENT
+        # คำนวณขนาดออเดอร์ (50% ของพอร์ต)
+        use_balance = balance * 0.7  # ใช้ 50% ของพอร์ต
         
         # ดึงราคาปัจจุบัน
         ticker = exchange.fetch_ticker(symbol)
@@ -289,11 +219,10 @@ Entry: {current_price:,.0f}
 TP: {tp_price:,.0f}
 SL: {sl_price:,.0f}
 💰 ใช้เงิน: {use_balance:,.1f} USDT ({leverage}x)
-💼 จากยอดคงเหลือ: {balance:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
 📊 ขนาด: {order_size:.6f} BTC"""
         
         send_telegram(message)
-        logger.info(f"Order opened: {direction} at {current_price}, size: {order_size}, capital used: {use_balance} from balance: {balance}")
+        logger.info(f"Order opened: {direction} at {current_price}, size: {order_size}")
         return True
         
     except Exception as e:
@@ -342,56 +271,49 @@ def monitor_position():
             # โพซิชันถูกปิดแล้ว - ตรวจสอบว่าปิดด้วยอะไร
             current_price = float(exchange.fetch_ticker(symbol)['last'])
             
-            # คำนวณ PnL โดยประมาณ
             if current_position == 'long':
-                pnl_points = current_price - entry_price
+                pnl = current_price - entry_price
                 if current_price >= entry_price + tp_value:
                     close_reason = "TP"
                     emoji = "✅"
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage  # ประมาณการ
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+กำไร: +{abs(pnl_usdt):,.0f} USDT"""
                 elif current_price <= entry_price - sl_value:
                     close_reason = "SL"
                     emoji = "❌"
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+ขาดทุน: {pnl_usdt:,.0f} USDT"""
                 else:
                     close_reason = "บังคับปิด"
                     emoji = "🔄"
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+P&L: {pnl_usdt:,.0f} USDT"""
             else:  # short
-                pnl_points = entry_price - current_price
+                pnl = entry_price - current_price
                 if current_price <= entry_price - tp_value:
                     close_reason = "TP"
                     emoji = "✅"
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+กำไร: +{abs(pnl_usdt):,.0f} USDT"""
                 elif current_price >= entry_price + sl_value:
                     close_reason = "SL"
                     emoji = "❌"
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+ขาดทุน: {pnl_usdt:,.0f} USDT"""
                 else:
                     close_reason = "บังคับปิด"
                     emoji = "🔄"
-            
-            # คำนวณ PnL ใน USDT (ใช้ยอดคงเหลือปัจจุบัน)
-            current_balance = get_portfolio_balance()
-            use_balance = current_balance * CAPITAL_USAGE_PERCENT
-            position_value = (use_balance * leverage) / entry_price
-            pnl_usdt = pnl_points * position_value
-            
-            # ส่งข้อความแจ้งเตือน
-            if close_reason in ["TP", "SL"]:
-                if pnl_usdt > 0:
+                    pnl_usdt = pnl * exchange.fetch_ticker(symbol)['last'] / leverage
                     message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-กำไร: +{abs(pnl_usdt):,.0f} USDT
-💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
-                else:
-                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-ขาดทุน: {pnl_usdt:,.0f} USDT
-💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
-            else:
-                message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
-P&L: {pnl_usdt:,.0f} USDT
-💰 ทุนที่ใช้: {use_balance:,.1f} USDT"""
+P&L: {pnl_usdt:,.0f} USDT"""
             
             send_telegram(message)
-            logger.info(f"Position closed: {close_reason}, PnL: {pnl_usdt:.2f}")
-            
-            # บันทึกสถิติ
-            add_trade_result(close_reason, pnl_usdt)
+            logger.info(f"Position closed: {close_reason}")
             
             # รีเซ็ตสถานะ
             current_position = None
@@ -418,7 +340,7 @@ P&L: {pnl_usdt:,.0f} USDT
         logger.error(f"Monitor position error: {e}")
         send_telegram(f"⛔️ Error: ไม่สามารถตรวจสอบโพซิชันได้\nรายละเอียด: {e}")
 
-# === รายงานประจำวัน (พร้อมสถิติ) ===
+# === รายงานประจำวัน ===
 def daily_report():
     global last_daily_report
     
@@ -431,28 +353,8 @@ def daily_report():
     
     try:
         balance = get_portfolio_balance()
-        
-        # ดึงสถิติประจำวัน
-        today_str = now.strftime('%Y-%m-%d')
-        if daily_stats['date'] == today_str:
-            tp_count = daily_stats['tp_count']
-            sl_count = daily_stats['sl_count']
-            total_pnl = daily_stats['total_pnl']
-        else:
-            tp_count = 0
-            sl_count = 0
-            total_pnl = 0
-        
-        # คำนวณกำไร/ขาดทุนจากเมื่อเริ่มต้น
-        pnl_from_start = balance - initial_balance if initial_balance > 0 else 0
-        
-        message = f"""📊 รายงานประจำวัน
-🔹 กำไรสุทธิ: {total_pnl:+,.0f} USDT
-🔹 SL: {sl_count} ครั้ง
-🔹 TP: {tp_count} ครั้ง
-🔹 คงเหลือ: {balance:,.1f} USDT
-🔹 ทุนต่อเทรดถัดไป: {balance * CAPITAL_USAGE_PERCENT:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
-⏱ บอทยังทำงานปกติ ✅
+        message = f"""⏱ บอทยังทำงานปกติ ✅
+ยอดคงเหลือ: {balance:,.1f} USDT
 วันที่: {now.strftime('%d/%m/%Y %H:%M')}"""
         
         send_telegram(message)
@@ -472,40 +374,15 @@ def daily_report_scheduler():
         except Exception as e:
             logger.error(f"Daily report scheduler error: {e}")
 
-# === แจ้งเตือนเมื่อบอทเริ่มทำงาน ===
-def send_startup_message():
-    global initial_balance
-    
-    try:
-        initial_balance = get_portfolio_balance()
-        startup_time = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-        
-        message = f"""🔄 บอทเริ่มทำงาน
-🤖 EMA Cross Trading Bot
-💼 ยอดคงเหลือ: {initial_balance:,.1f} USDT
-💰 ทุนต่อเทรดแรก: {initial_balance * CAPITAL_USAGE_PERCENT:,.1f} USDT ({CAPITAL_USAGE_PERCENT*100:.0f}%)
-⏰ เวลาเริ่ม: {startup_time}
-📊 เฟรม: {timeframe} | Leverage: {leverage}x
-🎯 TP: {tp_value} | SL: {sl_value}
-🔧 ใช้เงิน: {CAPITAL_USAGE_PERCENT*100:.0f}% ของยอดคงเหลือปัจจุบัน
-📈 รอสัญญาณ EMA Cross..."""
-        
-        send_telegram(message)
-        logger.info(f"Startup message sent - Using {CAPITAL_USAGE_PERCENT*100:.0f}% of current balance per trade")
-        
-    except Exception as e:
-        logger.error(f"Startup message error: {e}")
-
 # === MAIN LOOP ===
 def main():
-    global portfolio_balance, initial_balance
+    global portfolio_balance
     
     try:
-        # โหลดสถิติ
-        load_daily_stats()
-        
-        # ส่งข้อความเริ่มต้น
-        send_startup_message()
+        # เริ่มต้น
+        portfolio_balance = get_portfolio_balance()
+        send_telegram(f"🤖 EMA Cross Bot เริ่มทำงาน\nยอดคงเหลือ: {portfolio_balance:,.1f} USDT")
+        logger.info("Bot started")
         
         # เริ่ม Daily Report Scheduler
         daily_thread = threading.Thread(target=daily_report_scheduler, daemon=True)
@@ -533,7 +410,7 @@ def main():
                     if success:
                         time.sleep(5)  # รอสักครู่หลังเปิดออเดอร์
             
-            time.sleep(8)  # เช็คทุก 8 วินาที (เร็วที่สุด)
+            time.sleep(10)  # เช็คทุก 10 วินาที (เร็วขึ้น)
             
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
