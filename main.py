@@ -169,7 +169,7 @@ def open_order_with_tpsl(direction):
             return False
         
         # คำนวณขนาดออเดอร์ (50% ของพอร์ต)
-        use_balance = balance * 0.7  # ใช้ 50% ของพอร์ต
+        use_balance = balance * 1  # ใช้ 50% ของพอร์ต
         
         # ดึงราคาปัจจุบัน
         ticker = exchange.fetch_ticker(symbol)
