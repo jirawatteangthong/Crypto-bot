@@ -3,6 +3,9 @@ import time
 import requests
 from datetime import datetime, timedelta
 import logging
+import threading
+import json
+import os
 
 # === ตั้งค่า Logging ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -10,29 +13,40 @@ logger = logging.getLogger(__name__)
 
 # === ตั้งค่า ===
 api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'       # ใส่ API KEY
-secret = '05A665CEAF8B2161483DF63CB10085D2'   # ใส่ SECRET KEY ของคุณ
-password = 'Jirawat1-' # ใส่ Password (ถ้ามี) ของคุณ
-
+secret = '05A665CEAF8B2161483DF63CB10085D2'  # ใส่ secret ของคุณ
+password = 'Jirawat1-'  # ใส่ password ของคุณ
 symbol = 'BTC/USDT:USDT'
 timeframe = '15m'
-# order_size จะถูกคำนวณจาก 80% ของพอร์ต
-leverage = 25  # *** เปลี่ยน Leverage เป็น 25x ***
-tp_value = 500  # TP เป็นค่าคงที่ (USDT)
-sl_value = 990  # SL เป็นค่าคงที่ (USDT)
-be_profit_trigger_usdt = 350 # กำไร 350 USDT จะเลื่อน SL
-be_sl_offset_usdt = 100 # เลื่อน SL ให้ต่ำกว่าราคาเข้าเล็กน้อย 100 USDT (กันค่าธรรมเนียม)
+leverage = 25
+tp_value = 500
+sl_value = 990
+be_profit_trigger = 350
+be_sl = 100
 
 telegram_token = '7752789264:AAF-0zdgHsSSYe7PS17ePYThOFP3k7AjxBY'
 telegram_chat_id = '8104629569'
+
+# === ไฟล์เก็บข้อมูล ===
+STATS_FILE = 'trading_stats.json'
 
 # === สถานะการเทรด ===
 current_position = None  # None, 'long', 'short'
 entry_price = None
 order_id = None
 sl_moved = False
-last_ema_state = None  # เก็บสถานะ EMA ก่อนหน้า ('above', 'below')
-last_cross_signal = None # เก็บสัญญาณ cross ล่าสุดที่ตรวจพบ
-last_daily_report_time = None # เวลาที่ส่งรายงานประจำวันล่าสุด
+last_ema_state = None
+portfolio_balance = 0
+last_daily_report = None
+initial_balance = 0
+
+# === สถิติการเทรด ===
+daily_stats = {
+    'date': None,
+    'tp_count': 0,
+    'sl_count': 0,
+    'total_pnl': 0,
+    'trades': []
+}
 
 # === Exchange Setup ===
 exchange = ccxt.okx({
@@ -42,7 +56,66 @@ exchange = ccxt.okx({
     'enableRateLimit': True,
     'options': {'defaultType': 'swap'}
 })
-exchange.set_sandbox_mode(False) # ตั้งเป็น False สำหรับบัญชีจริง
+exchange.set_sandbox_mode(False)
+
+# === บันทึกสถิติ ===
+def load_daily_stats():
+    global daily_stats
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                daily_stats = json.load(f)
+    except Exception as e:
+        logger.error(f"Load stats error: {e}")
+        daily_stats = {
+            'date': None,
+            'tp_count': 0,
+            'sl_count': 0,
+            'total_pnl': 0,
+            'trades': []
+        }
+
+def save_daily_stats():
+    try:
+        with open(STATS_FILE, 'w') as f:
+            json.dump(daily_stats, f)
+    except Exception as e:
+        logger.error(f"Save stats error: {e}")
+
+def reset_daily_stats():
+    global daily_stats
+    daily_stats = {
+        'date': datetime.now().strftime('%Y-%m-%d'),
+        'tp_count': 0,
+        'sl_count': 0,
+        'total_pnl': 0,
+        'trades': []
+    }
+    save_daily_stats()
+
+def add_trade_result(close_type, pnl_usdt):
+    global daily_stats
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # เช็คว่าเป็นวันใหม่หรือไม่
+    if daily_stats['date'] != today:
+        reset_daily_stats()
+    
+    # เพิ่มข้อมูลการเทรด
+    if close_type == 'TP':
+        daily_stats['tp_count'] += 1
+    elif close_type == 'SL':
+        daily_stats['sl_count'] += 1
+    
+    daily_stats['total_pnl'] += pnl_usdt
+    daily_stats['trades'].append({
+        'time': datetime.now().strftime('%H:%M:%S'),
+        'type': close_type,
+        'pnl': pnl_usdt
+    })
+    
+    save_daily_stats()
 
 # === Telegram ===
 def send_telegram(msg):
@@ -54,7 +127,21 @@ def send_telegram(msg):
         )
         logger.info(f"Telegram: {msg}")
     except Exception as e:
-        logger.error(f"Telegram error: {e}. Message: {msg}")
+        logger.error(f"Telegram error: {e}")
+        logger.error("⛔️ Error: ไม่สามารถส่งข้อความ Telegram ได้")
+
+# === ดึงยอดคงเหลือ ===
+def get_portfolio_balance():
+    global portfolio_balance
+    try:
+        balance = exchange.fetch_balance()
+        usdt_balance = balance['USDT']['free'] + balance['USDT']['used']
+        portfolio_balance = usdt_balance
+        return usdt_balance
+    except Exception as e:
+        logger.error(f"Get balance error: {e}")
+        send_telegram(f"⛔️ Error: ไม่สามารถดึงยอดคงเหลือได้\nรายละเอียด: {e}")
+        return 0
 
 # === คำนวณ EMA ===
 def calculate_ema(prices, period):
@@ -72,9 +159,9 @@ def calculate_ema(prices, period):
     
     return ema
 
-# === ตรวจสอบการตัดกันของ EMA ===
+# === ตรวจสอบการตัดกันของ EMA (เร็วที่สุด - เช็ค 1-2 เทียน) ===
 def check_ema_cross():
-    global last_ema_state, last_cross_signal
+    global last_ema_state
     
     try:
         # ดึงข้อมูลเทียน
@@ -82,52 +169,35 @@ def check_ema_cross():
         closes = [candle[4] for candle in ohlcv]
         
         if len(closes) < 200:
-            logger.warning("Not enough data to calculate EMA.")
             return None
         
-        # คำนวณ EMA สำหรับเทียนปัจจุบันและก่อนหน้า
+        # คำนวณ EMA สำหรับ 2 เทียนล่าสุด (เร็วที่สุด)
         current_ema50 = calculate_ema(closes, 50)
         current_ema200 = calculate_ema(closes, 200)
         prev_ema50 = calculate_ema(closes[:-1], 50)
         prev_ema200 = calculate_ema(closes[:-1], 200)
         
         if None in [current_ema50, current_ema200, prev_ema50, prev_ema200]:
-            logger.warning("EMA calculation returned None.")
             return None
         
-        # เก็บสถานะปัจจุบัน
-        current_ema_position = 'above' if current_ema50 > current_ema200 else 'below'
-        
+        # ตรวจสอบการตัดกันแบบเร็วที่สุด (ตัดในเทียนล่าสุด)
         cross_signal = None
         
-        # Golden Cross: EMA50 ตัดขึ้นเหนือ EMA200
+        # Golden Cross: EMA50 ตัดขึ้นเหนือ EMA200 ในเทียนล่าสุด
         if prev_ema50 <= prev_ema200 and current_ema50 > current_ema200:
             cross_signal = 'long'
-            logger.info(f"Golden Cross detected: EMA50({current_ema50:.2f}) > EMA200({current_ema200:.2f})")
+            logger.info(f"Golden Cross detected (Ultra Fast): EMA50({current_ema50:.2f}) > EMA200({current_ema200:.2f})")
         
-        # Death Cross: EMA50 ตัดลงใต้ EMA200  
+        # Death Cross: EMA50 ตัดลงใต้ EMA200 ในเทียนล่าสุด
         elif prev_ema50 >= prev_ema200 and current_ema50 < current_ema200:
             cross_signal = 'short'
-            logger.info(f"Death Cross detected: EMA50({current_ema50:.2f}) < EMA200({current_ema200:.2f})")
+            logger.info(f"Death Cross detected (Ultra Fast): EMA50({current_ema50:.2f}) < EMA200({current_ema200:.2f})")
         
-        # อัพเดต last_ema_state สำหรับการตรวจสอบครั้งถัดไป
-        last_ema_state = current_ema_position
-        
-        # เพื่อให้เปิดออเดอร์ไวกว่านี้:
-        # ส่งสัญญาณเฉพาะเมื่อมีการตัดกันใหม่ และไม่ใช่สัญญาณเดียวกับที่ส่งไปล่าสุด
-        if cross_signal and cross_signal != last_cross_signal:
-            last_cross_signal = cross_signal
-            return cross_signal
-        elif not cross_signal:
-            # ถ้าไม่มีสัญญาณตัดกัน ให้รีเซ็ต last_cross_signal เพื่อรอสัญญาณใหม่
-            last_cross_signal = None
-            
-        return None # ไม่มีสัญญาณตัดกันใหม่
+        return cross_signal
         
     except Exception as e:
-        error_msg = f"❌ Error in check_ema_cross: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: การตรวจสอบ EMA ล้มเหลว\nรายละเอียด: {error_msg}")
+        logger.error(f"EMA calculation error: {e}")
+        send_telegram(f"⛔️ Error: ไม่สามารถคำนวณ EMA ได้\nรายละเอียด: {e} | Retry อีกครั้งใน 30 วินาที")
         return None
 
 # === ตรวจสอบโพซิชันปัจจุบัน ===
@@ -135,47 +205,20 @@ def get_current_position():
     try:
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
-            if float(pos['contracts']) != 0: # ตรวจสอบ contracts ไม่เท่ากับ 0
+            if pos['contracts'] > 0:
                 return {
-                    'side': 'long' if float(pos['contracts']) > 0 else 'short',
-                    'size': abs(float(pos['contracts'])),
-                    'entry_price': float(pos['entryPrice']),
-                    'unrealized_pnl': float(pos['unrealizedPnl']),
-                    'liquidation_price': float(pos['liquidationPrice']) if 'liquidationPrice' in pos else None
+                    'side': pos['side'],
+                    'size': pos['contracts'],
+                    'entry_price': pos['entryPrice'],
+                    'unrealized_pnl': pos['unrealizedPnl']
                 }
         return None
-    except ccxt.NetworkError as e:
-        error_msg = f"Network Error: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: การเชื่อมต่อ API มีปัญหา\nรายละเอียด: {error_msg} | ลองอีกครั้งใน 30 วินาที")
-        time.sleep(30)
-        return None
     except Exception as e:
-        error_msg = f"Error fetching position: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: ไม่สามารถดึงข้อมูลโพซิชันได้\nรายละเอียด: {error_msg}")
+        logger.error(f"Get position error: {e}")
+        send_telegram(f"⛔️ Error: ไม่สามารถดึงข้อมูลโพซิชันได้\nรายละเอียด: {e}")
         return None
 
-# === ดึงยอดคงเหลือ USDT ===
-def get_balance():
-    try:
-        balance = exchange.fetch_balance()
-        if 'USDT' in balance['total']:
-            return balance['total']['USDT']
-        return 0
-    except ccxt.NetworkError as e:
-        error_msg = f"Network Error: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: การเชื่อมต่อ API มีปัญหา\nรายละเอียด: {error_msg} | ลองอีกครั้งใน 30 วินาที")
-        time.sleep(30)
-        return 0
-    except Exception as e:
-        error_msg = f"Error fetching balance: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: ไม่สามารถดึงยอดคงเหลือได้\nรายละเอียด: {error_msg}")
-        return 0
-
-# === เปิดออเดอร์พร้อม TP/SL ===
+# === เปิดออเดอร์พร้อม TP/SL (ใช้ 50% ของพอร์ต) ===
 def open_order_with_tpsl(direction):
     global current_position, entry_price, order_id, sl_moved
     
@@ -186,69 +229,50 @@ def open_order_with_tpsl(direction):
             logger.info("มีโพซิชันอยู่แล้ว ข้ามการเปิดออเดอร์")
             return False
         
+        # ดึงยอดคงเหลือ
+        balance = get_portfolio_balance()
+        if balance <= 0:
+            send_telegram("⛔️ Error: ไม่สามารถดึงยอดคงเหลือได้")
+            return False
+        
+        # คำนวณขนาดออเดอร์ (50% ของพอร์ต)
+        use_balance = balance * 0.8  # ใช้ 50% ของพอร์ต
+        
         # ดึงราคาปัจจุบัน
         ticker = exchange.fetch_ticker(symbol)
         current_price = float(ticker['last'])
         
-        # คำนวณขนาดออเดอร์ 80% ของพอร์ต
-        available_balance = get_balance()
-        if available_balance <= 0:
-            send_telegram("⚠️ ไม่มียอดคงเหลือ USDT เพียงพอสำหรับการเปิดออเดอร์")
-            logger.warning("No USDT balance to open order.")
-            return False
-
-        # คำนวณขนาดออเดอร์ (BTC) จาก 80% ของพอร์ต Leverage และราคาปัจจุบัน
-        # (80% ของ balance * leverage) / current_price = quantity
-        calculated_order_size_usdt = available_balance * 0.80 * leverage # *** เปลี่ยนเป็น 0.80 ***
-        calculated_order_size_btc = calculated_order_size_usdt / current_price
-
-        # ตรวจสอบขั้นต่ำของขนาดออเดอร์ (อาจจะต้องดึงมาจาก exchange info)
-        market = exchange.market(symbol)
-        # ใช้ Max(min_amount, min_notional_value / current_price) เพื่อให้แน่ใจว่าผ่านทั้ง 2 เกณฑ์
-        min_amount = market['limits']['amount']['min'] if 'amount' in market['limits'] else 0.00001 # ค่าเริ่มต้นเผื่อไว้
-        min_notional = market['limits']['cost']['min'] if 'cost' in market['limits'] and market['limits']['cost']['min'] is not None else 10 # OKX BTC/USDT notional usually ~100
+        # คำนวณขนาดออเดอร์ตาม leverage
+        order_size = (use_balance * leverage) / current_price
+        order_size = round(order_size, 6)  # ปรับเป็นทศนิยม 6 ตำแหน่ง
         
-        # คำนวณ min_amount ที่แท้จริงโดยพิจารณา Notional Value
-        # ตรวจสอบว่า min_notional_btc_equivalent มีค่าที่สมเหตุสมผลหรือไม่
-        min_notional_btc_equivalent = min_notional / current_price
-        
-        actual_min_order_btc = max(min_amount, min_notional_btc_equivalent)
-        
-        if calculated_order_size_btc < actual_min_order_btc:
-            send_telegram(f"⚠️ ขนาดออเดอร์ที่คำนวณได้ ({calculated_order_size_btc:.5f} BTC) ต่ำกว่าขั้นต่ำ ({actual_min_order_btc:.5f} BTC) ที่ {min_notional:.2f} USDT")
-            logger.warning(f"Calculated order size {calculated_order_size_btc:.5f} BTC is below minimum {actual_min_order_btc:.5f} BTC (derived from notional {min_notional:.2f} USDT).")
-            return False
-
-        order_size_btc = round(calculated_order_size_btc, 5) # ปัดเศษตามความเหมาะสม
-
         # คำนวณ TP และ SL
         if direction == 'long':
             tp_price = current_price + tp_value
             sl_price = current_price - sl_value
             side = 'buy'
-        else: # direction == 'short'
+            emoji = '📈'
+        else:
             tp_price = current_price - tp_value
             sl_price = current_price + sl_value
             side = 'sell'
+            emoji = '📉'
         
-        # พารามิเตอร์สำหรับ OKX (รองรับ TP/SL ในคำสั่งเดียว)
+        # พารามิเตอร์สำหรับ OKX
         params = {
             'tdMode': 'cross',
             'ordType': 'market',
             'lever': str(leverage),
-            'reduceOnly': False, # ต้องเป็น False ในการเปิดโพซิชันใหม่
-            'tpTriggerPx': str(round(tp_price, 2)),
-            'tpOrdPx': '-1', # -1 หมายถึง market order เมื่อ TP ถึง
+            'tpTriggerPx': str(tp_price),
+            'tpOrdPx': '-1',
             'tpTriggerPxType': 'last',
-            'slTriggerPx': str(round(sl_price, 2)), 
-            'slOrdPx': '-1', # -1 หมายถึง market order เมื่อ SL ถึง
+            'slTriggerPx': str(sl_price),
+            'slOrdPx': '-1',
             'slTriggerPxType': 'last'
         }
         
-        logger.info(f"Attempting to open {direction} order: size={order_size_btc:.5f} BTC, current_price={current_price:.2f}, TP={tp_price:.2f}, SL={sl_price:.2f}")
-
         # สร้างออเดอร์
-        order = exchange.create_order(symbol, 'market', side, order_size_btc, None, params)
+        order = exchange.create_order(symbol, 'market', side, order_size, None, params)
         
         # อัพเดตสถานะ
         current_position = direction
@@ -256,164 +280,235 @@ def open_order_with_tpsl(direction):
         order_id = order.get('id')
         sl_moved = False
         
-        # ส่งแจ้งเตือน
-        message = f"""📈 เข้าซื้อ {direction.upper()}
-💰 ราคาเข้า: {entry_price:.2f}
-🎯 TP: {tp_price:.2f} (+{tp_value:.2f})
-🛡️ SL: {sl_price:.2f} (-{sl_value:.2f})
-📊 ขนาด: {order_size_btc:.5f} BTC ({calculated_order_size_usdt:.2f} USDT @ {leverage}x)
-Order ID: {order_id}"""
+        # ส่งแจ้งเตือนแบบใหม่
+        message = f"""{emoji} เข้าซื้อ {direction.upper()}
+Entry: {current_price:,.0f}
+TP: {tp_price:,.0f}
+SL: {sl_price:,.0f}
+💰 ใช้เงิน: {use_balance:,.1f} USDT ({leverage}x)
+📊 ขนาด: {order_size:.6f} BTC"""
         
         send_telegram(message)
-        logger.info(f"Order opened successfully: {direction} at {entry_price:.2f}")
+        logger.info(f"Order opened: {direction} at {current_price}, size: {order_size}")
         return True
         
-    except ccxt.NetworkError as e:
-        error_msg = f"Network Error (Order Fail): {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: ไม่สามารถเชื่อมต่อ OKX API (Order Fail)\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 30 วินาที")
-        time.sleep(30)
-        return False
-    except ccxt.ExchangeError as e:
-        error_msg = f"Exchange Error (Order Fail): {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: คำสั่งซื้อล้มเหลว\nรายละเอียด: {error_msg}")
-        return False
     except Exception as e:
-        error_msg = f"❌ เปิดออเดอร์ล้มเหลว: {e}"
-        send_telegram(f"⛔️ Error: เปิดออเดอร์ล้มเหลว\nรายละเอียด: {error_msg}")
-        logger.error(error_msg)
+        error_msg = f"⛔️ Error: ไม่สามารถเปิดออเดอร์ได้\nรายละเอียด: {e} | Retry อีกครั้งใน 30 วินาที"
+        send_telegram(error_msg)
+        logger.error(f"Order failed: {e}")
         return False
 
 # === เลื่อน SL เป็นกันทุน ===
 def move_sl_to_breakeven():
     global sl_moved
     
-    if sl_moved or not current_position or not entry_price:
+    try:
+        if sl_moved:
+            return
+        
+        # คำนวณ SL ใหม่ (กันทุน)
+        if current_position == 'long':
+            new_sl = entry_price - be_sl
+        else:
+            new_sl = entry_price + be_sl
+        
+        sl_moved = True
+        message = f"""🔄 ราคาวิ่ง +{be_profit_trigger} แล้ว → เลื่อน SL ไปที่ราคาเข้า (Break-even)
+📍 Entry: {entry_price:,.0f}
+🛡️ SL ใหม่: {new_sl:,.0f}"""
+        
+        send_telegram(message)
+        logger.info(f"SL moved to breakeven: {new_sl}")
+        
+    except Exception as e:
+        logger.error(f"Move SL error: {e}")
+
+# === ตรวจสอบโพซิชันและจัดการ SL ===
+def monitor_position():
+    global current_position, sl_moved, entry_price, order_id
+    
+    if not current_position:
         return
         
     try:
+        # เช็คโพซิชันจริง
         pos_info = get_current_position()
+        
         if not pos_info:
-            logger.info("ไม่มีโพซิชันอยู่ ไม่สามารถเลื่อน SL ได้")
-            return
-
-        # คำนวณ SL ใหม่ (กันทุน + offset เล็กน้อย)
-        if current_position == 'long':
-            new_sl_price = entry_price + be_sl_offset_usdt
-        else: # short
-            new_sl_price = entry_price - be_sl_offset_usdt
-
-        sl_moved = True
-        message = f"""🔄 ราคาวิ่ง +{be_profit_trigger_usdt} USDT แล้ว → เลื่อน SL ไปที่ราคาเข้า (Break-even)
-📍 ราคาเข้า: {entry_price:.2f}
-🛡️ SL ใหม่: {new_sl_price:.2f} (กันทุน)
-💚 โพซิชัน: {current_position.upper()}"""
-        
-        send_telegram(message)
-        logger.info(f"SL moved to breakeven for {current_position} position at {entry_price:.2f}. New SL: {new_sl_price:.2f}")
-        
-    except Exception as e:
-        error_msg = f"Error moving SL to breakeven: {e}"
-        logger.error(error_msg)
-        send_telegram(f"⛔️ Error: ไม่สามารถเลื่อน SL ได้\nรายละเอียด: {error_msg}")
-
-# === ตรวจสอบโพซิชันและจัดการ SL/TP ===
-def monitor_position():
-    global current_position, entry_price, sl_moved
-    
-    pos_info = get_current_position()
-
-    if pos_info:
-        # มีโพซิชันอยู่
-        if current_position is None:
-            # หาก bot เพิ่งเริ่มทำงานและพบโพซิชัน ให้โหลดสถานะ
-            current_position = pos_info['side']
-            entry_price = pos_info['entry_price']
-            sl_moved = False # สมมติว่ายังไม่เลื่อนเมื่อเริ่มใหม่
-
-        current_price = float(exchange.fetch_ticker(symbol)['last'])
-        pnl_usdt = pos_info['unrealized_pnl'] # PnL เป็น USDT
-        
-        # เลื่อน SL เมื่อกำไรถึงเป้าหมาย (be_profit_trigger_usdt)
-        if not sl_moved and pnl_usdt >= be_profit_trigger_usdt:
-            move_sl_to_breakeven()
-        
-        logger.info(f"Position: {current_position}, Entry: {entry_price:.2f}, Current: {current_price:.2f}, PnL: {pnl_usdt:.2f} USDT")
-        
-    else:
-        # ไม่มีโพซิชันอยู่ (หรือเพิ่งปิดไป)
-        if current_position is not None:
-            # โพซิชันถูกปิดแล้ว
+            # โพซิชันถูกปิดแล้ว - ตรวจสอบว่าปิดด้วยอะไร
+            current_price = float(exchange.fetch_ticker(symbol)['last'])
             
-            # ดึง PnL สุดท้ายจากสถานะก่อนหน้า (หากมี) หรือพยายามหาจาก history
-            # สำหรับ OKX, การดึง PnL จากออเดอร์ที่ปิดไปแล้วอาจต้องใช้ fetch_orders
-            # หรือ fetch_my_trades โดยดูที่ 'status' และ 'info' ของแต่ละรายการ
-
-            # นี่คือตัวอย่างที่สมมติว่าเราสามารถรู้ PnL ได้ (คุณอาจต้องปรับให้เข้ากับข้อมูลจริงที่ดึงมาได้)
-            # ในกรณีที่ไม่มีข้อมูล PnL ที่ชัดเจนจาก API ทันทีหลังปิด เราจะแจ้งเพียงว่าปิดแล้ว
+            # คำนวณ PnL โดยประมาณ
+            if current_position == 'long':
+                pnl_points = current_price - entry_price
+                if current_price >= entry_price + tp_value:
+                    close_reason = "TP"
+                    emoji = "✅"
+                elif current_price <= entry_price - sl_value:
+                    close_reason = "SL"
+                    emoji = "❌"
+                else:
+                    close_reason = "บังคับปิด"
+                    emoji = "🔄"
+            else:  # short
+                pnl_points = entry_price - current_price
+                if current_price <= entry_price - tp_value:
+                    close_reason = "TP"
+                    emoji = "✅"
+                elif current_price >= entry_price + sl_value:
+                    close_reason = "SL"
+                    emoji = "❌"
+                else:
+                    close_reason = "บังคับปิด"
+                    emoji = "🔄"
             
-            # สมมติว่าเรามีข้อมูล PnL จากการปิด (คุณต้องแทนที่ด้วยการดึงจริง)
-            # ตัวอย่างเช่น:
-            # closed_pnl = some_function_to_get_last_closed_order_pnl()
-            closed_pnl = 0 # ค่าเริ่มต้น
+            # คำนวณ PnL ใน USDT (ประมาณการ)
+            position_value = (portfolio_balance * 0.5 * leverage) / entry_price
+            pnl_usdt = pnl_points * position_value
             
-            # การระบุว่าปิดด้วย TP, SL หรือบังคับปิด
-            message_prefix = "✅ ปิดออเดอร์ด้วย"
-            if closed_pnl > 0: # สมมติว่า PnL เป็นบวกคือ TP
-                close_reason = "TP"
-            elif closed_pnl < 0: # สมมติว่า PnL เป็นลบคือ SL
-                close_reason = "SL"
+            # ส่งข้อความแจ้งเตือน
+            if close_reason in ["TP", "SL"]:
+                if pnl_usdt > 0:
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+กำไร: +{abs(pnl_usdt):,.0f} USDT"""
+                else:
+                    message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+ขาดทุน: {pnl_usdt:,.0f} USDT"""
             else:
-                close_reason = "บังคับปิด" # หรืออื่นๆ เช่น liquidation
+                message = f"""{emoji} ปิดออเดอร์ด้วย {close_reason}
+P&L: {pnl_usdt:,.0f} USDT"""
             
-            message = f"{message_prefix} {close_reason}\n"
-            if closed_pnl != 0:
-                message += f"กำไร/ขาดทุน: {'+' if closed_pnl >= 0 else ''}{closed_pnl:.2f} USDT"
-            else:
-                message += f"โพซิชัน {current_position.upper()} ถูกปิดแล้ว" # กรณีไม่รู้ PnL ที่ชัดเจน
-
             send_telegram(message)
-            logger.info(f"Position {current_position} closed.")
+            logger.info(f"Position closed: {close_reason}, PnL: {pnl_usdt:.2f}")
             
+            # บันทึกสถิติ
+            add_trade_result(close_reason, pnl_usdt)
+            
+            # รีเซ็ตสถานะ
             current_position = None
             entry_price = None
             order_id = None
             sl_moved = False
+            return
+        
+        # คำนวณ PnL
+        current_price = float(exchange.fetch_ticker(symbol)['last'])
+        
+        if current_position == 'long':
+            pnl = current_price - entry_price
         else:
-            logger.info("No active position.")
+            pnl = entry_price - current_price
+        
+        # เลื่อน SL เมื่อกำไรถึง 350
+        if not sl_moved and pnl >= be_profit_trigger:
+            move_sl_to_breakeven()
+        
+        logger.info(f"Position: {current_position}, PnL: {pnl:.2f}, Price: {current_price:.2f}")
+        
+    except Exception as e:
+        logger.error(f"Monitor position error: {e}")
+        send_telegram(f"⛔️ Error: ไม่สามารถตรวจสอบโพซิชันได้\nรายละเอียด: {e}")
 
-# === ส่งรายงานประจำวัน ===
+# === รายงานประจำวัน (พร้อมสถิติ) ===
 def daily_report():
-    global last_daily_report_time
+    global last_daily_report
     
-    current_time = datetime.now()
+    now = datetime.now()
+    today = now.date()
     
-    if last_daily_report_time is None:
-        last_daily_report_time = current_time # ตั้งค่าครั้งแรก
-        return # ไม่ส่งทันที
-
-    if (current_time - last_daily_report_time) >= timedelta(days=1):
-        balance = get_balance()
-        message = f"⏱ บอทยังทำงานปกติ ✅\nยอดคงเหลือ: {balance:.2f} USDT"
+    # เช็คว่าส่งรายงานวันนี้แล้วหรือยัง
+    if last_daily_report == today:
+        return
+    
+    try:
+        balance = get_portfolio_balance()
+        
+        # ดึงสถิติประจำวัน
+        today_str = now.strftime('%Y-%m-%d')
+        if daily_stats['date'] == today_str:
+            tp_count = daily_stats['tp_count']
+            sl_count = daily_stats['sl_count']
+            total_pnl = daily_stats['total_pnl']
+        else:
+            tp_count = 0
+            sl_count = 0
+            total_pnl = 0
+        
+        # คำนวณกำไร/ขาดทุนจากเมื่อเริ่มต้น
+        pnl_from_start = balance - initial_balance if initial_balance > 0 else 0
+        
+        message = f"""📊 รายงานประจำวัน
+🔹 กำไรสุทธิ: {total_pnl:+,.0f} USDT
+🔹 SL: {sl_count} ครั้ง
+🔹 TP: {tp_count} ครั้ง
+🔹 คงเหลือ: {balance:,.1f} USDT
+⏱ บอทยังทำงานปกติ ✅
+วันที่: {now.strftime('%d/%m/%Y %H:%M')}"""
+        
         send_telegram(message)
-        last_daily_report_time = current_time # อัพเดตเวลาที่ส่งล่าสุด
-        logger.info("Daily report sent.")
+        last_daily_report = today
+        logger.info("Daily report sent")
+        
+    except Exception as e:
+        logger.error(f"Daily report error: {e}")
+        send_telegram(f"⛔️ Error: ไม่สามารถส่งรายงานประจำวันได้\nรายละเอียด: {e}")
+
+# === ฟังก์ชันรายงานประจำวันแบบ Background ===
+def daily_report_scheduler():
+    while True:
+        try:
+            time.sleep(3600)  # เช็คทุกชั่วโมง
+            daily_report()
+        except Exception as e:
+            logger.error(f"Daily report scheduler error: {e}")
+
+# === แจ้งเตือนเมื่อบอทเริ่มทำงาน ===
+def send_startup_message():
+    global initial_balance
+    
+    try:
+        initial_balance = get_portfolio_balance()
+        startup_time = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+        
+        message = f"""🔄 บอทเริ่มทำงาน
+🤖 EMA Cross Trading Bot
+💰 ยอดเริ่มต้น: {initial_balance:,.1f} USDT
+⏰ เวลาเริ่ม: {startup_time}
+📊 เฟรม: {timeframe} | Leverage: {leverage}x
+🎯 TP: {tp_value} | SL: {sl_value}
+🔧 ใช้เงิน: 50% ต่อออเดอร์
+📈 รอสัญญาณ EMA Cross..."""
+        
+        send_telegram(message)
+        logger.info("Startup message sent")
+        
+    except Exception as e:
+        logger.error(f"Startup message error: {e}")
 
 # === MAIN LOOP ===
 def main():
-    send_telegram("🤖 EMA Cross Bot เริ่มทำงาน")
-    logger.info("Bot started.")
+    global portfolio_balance, initial_balance
     
-    # กำหนดเวลาสำหรับ daily report ครั้งแรก
-    global last_daily_report_time
-    last_daily_report_time = datetime.now()
-
+    try:
+        # โหลดสถิติ
+        load_daily_stats()
+        
+        # ส่งข้อความเริ่มต้น
+        send_startup_message()
+        
+        # เริ่ม Daily Report Scheduler
+        daily_thread = threading.Thread(target=daily_report_scheduler, daemon=True)
+        daily_thread.start()
+        
+    except Exception as e:
+        error_msg = f"⛔️ Error: ไม่สามารถเชื่อมต่อ OKX API\nรายละเอียด: {e} | Retry อีกครั้งใน 30 วินาที"
+        send_telegram(error_msg)
+        logger.error(f"Startup error: {e}")
+        time.sleep(30)
+        return
+    
     while True:
         try:
-            # ส่งรายงานประจำวัน
-            daily_report()
-
             # ตรวจสอบโพซิชันปัจจุบัน
             monitor_position()
             
@@ -422,43 +517,35 @@ def main():
                 signal = check_ema_cross()
                 
                 if signal:
-                    logger.info(f"EMA Cross Signal: {signal} detected. Attempting to open order.")
-                    open_order_with_tpsl(signal)
-                    time.sleep(5)  # รอสักครู่หลังเปิดออเดอร์เพื่อให้ API อัปเดตสถานะ
+                    logger.info(f"EMA Cross Signal: {signal}")
+                    success = open_order_with_tpsl(signal)
+                    if success:
+                        time.sleep(5)  # รอสักครู่หลังเปิดออเดอร์
             
-            time.sleep(15)  # เช็คทุก 15 วินาที
+            time.sleep(8)  # เช็คทุก 8 วินาที (เร็วที่สุด)
             
         except KeyboardInterrupt:
-            logger.info("Bot stopped by user.")
+            logger.info("Bot stopped by user")
             send_telegram("🛑 Bot หยุดทำงานโดยผู้ใช้")
             break
             
-        except ccxt.DDoSProtection as e:
-            error_msg = f"DDoS Protection: {e}"
-            logger.error(error_msg)
-            send_telegram(f"⛔️ Error: ถูกป้องกัน DDoS\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 60 วินาที")
-            time.sleep(60)
-        except ccxt.ExchangeNotAvailable as e:
-            error_msg = f"Exchange Not Available: {e}"
-            logger.error(error_msg)
-            send_telegram(f"⛔️ Error: Exchange ไม่พร้อมใช้งาน\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 60 วินาที")
-            time.sleep(60)
-        except ccxt.RequestTimeout as e:
-            error_msg = f"Request Timeout: {e}"
-            logger.error(error_msg)
-            send_telegram(f"⛔️ Error: API Request Timeout\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 30 วินาที")
-            time.sleep(30)
         except ccxt.NetworkError as e:
-            error_msg = f"Network Error: {e}"
+            error_msg = f"⛔️ Error: ไม่สามารถเชื่อมต่อ OKX API\nรายละเอียด: Network Timeout | Retry อีกครั้งใน 30 วินาที"
             logger.error(error_msg)
-            send_telegram(f"⛔️ Error: การเชื่อมต่อ API มีปัญหา\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 30 วินาที")
+            send_telegram(error_msg)
             time.sleep(30)
-        except Exception as e:
-            error_msg = f"❌ Main loop error: {e}"
+            
+        except ccxt.ExchangeError as e:
+            error_msg = f"⛔️ Error: OKX Exchange Error\nรายละเอียด: {e} | Retry อีกครั้งใน 30 วินาที"
             logger.error(error_msg)
-            send_telegram(f"⛔️ Error: ข้อผิดพลาดใน Main Loop\nรายละเอียด: {error_msg} | Retry อีกครั้งใน 30 วินาที")
+            send_telegram(error_msg)
+            time.sleep(30)
+            
+        except Exception as e:
+            error_msg = f"⛔️ Error: Main loop error\nรายละเอียด: {e} | Retry อีกครั้งใน 30 วินาที"
+            logger.error(error_msg)
+            send_telegram(error_msg)
             time.sleep(30)
 
 if __name__ == '__main__':
     main()
-
