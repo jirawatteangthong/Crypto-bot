@@ -7,14 +7,14 @@ import logging
 # === ตั้งค่า Logging ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 # === ตั้งค่า ===
 api_key = '8f528085-448c-4480-a2b0-d7f72afb38ad'       # ใส่ API KEY
 secret = '05A665CEAF8B2161483DF63CB10085D2'
 password = 'Jirawat1-'
 symbol = 'BTC/USDT:USDT'
 timeframe = '15m'
-leverage = 25
+order_size = 0.5
+leverage = 20
 tp_value = 500
 sl_value = 990
 be_profit_trigger = 350
@@ -29,7 +29,6 @@ entry_price = None
 order_id = None
 sl_moved = False
 last_ema_state = None  # เก็บสถานะ EMA ก่อนหน้า
-last_daily_report = None  # เวลารายงานรายวันล่าสุด
 
 # === Exchange Setup ===
 exchange = ccxt.okx({
@@ -111,7 +110,6 @@ def check_ema_cross():
         
     except Exception as e:
         logger.error(f"EMA calculation error: {e}")
-        send_telegram(f"⛔️ Error: เกิดข้อผิดพลาดในการคำนวณ EMA\nรายละเอียด: {str(e)}")
         return None
 
 # === ตรวจสอบโพซิชันปัจจุบัน ===
@@ -129,40 +127,6 @@ def get_current_position():
         return None
     except Exception as e:
         logger.error(f"Get position error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถตรวจสอบโพซิชัน\nรายละเอียด: {str(e)}")
-        return None
-
-# === ตรวจสอบยอดคงเหลือ ===
-def get_balance():
-    try:
-        balance = exchange.fetch_balance()
-        usdt_balance = balance['total']['USDT']
-        return float(usdt_balance)
-    except Exception as e:
-        logger.error(f"Get balance error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถตรวจสอบยอดคงเหลือ\nรายละเอียด: {str(e)}")
-        return None
-
-# === คำนวณขนาดออเดอร์ ===
-def calculate_order_size():
-    try:
-        balance = get_balance()
-        if balance is None:
-            return None
-            
-        # คำนวณ 90% ของพอร์ต
-        risk_amount = balance * 0.9
-        
-        # ดึงราคาปัจจุบัน
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = float(ticker['last'])
-        
-        # คำนวณขนาดออเดอร์ (ใน BTC)
-        order_size = risk_amount / current_price
-        return round(order_size, 4)
-    except Exception as e:
-        logger.error(f"Calculate order size error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถคำนวณขนาดออเดอร์\nรายละเอียด: {str(e)}")
         return None
 
 # === เปิดออเดอร์พร้อม TP/SL ===
@@ -174,11 +138,6 @@ def open_order_with_tpsl(direction):
         existing_pos = get_current_position()
         if existing_pos:
             logger.info("มีโพซิชันอยู่แล้ว ข้ามการเปิดออเดอร์")
-            return False
-        
-        # คำนวณขนาดออเดอร์
-        order_size = calculate_order_size()
-        if order_size is None:
             return False
         
         # ดึงราคาปัจจุบัน
@@ -218,18 +177,19 @@ def open_order_with_tpsl(direction):
         sl_moved = False
         
         # ส่งแจ้งเตือน
-        message = f"""📈 {'เข้าซื้อ Long' if direction == 'long' else 'เข้าซื้อ Short'}
-Entry: {current_price:.2f}
-TP: {tp_price:.2f}
-SL: {sl_price:.2f}
-ขนาด: {order_size} BTC"""
+        message = f"""🚀 เปิดออเดอร์ {direction.upper()}
+💰 ราคาเข้า: {current_price:.2f}
+🎯 TP: {tp_price:.2f} (+{tp_value})
+🛡️ SL: {sl_price:.2f} (-{sl_value})
+📊 ขนาด: {order_size} BTC
+Order ID: {order_id}"""
         
         send_telegram(message)
         logger.info(f"Order opened: {direction} at {current_price}")
         return True
         
     except Exception as e:
-        error_msg = f"⛔️ Error: เปิดออเดอร์ล้มเหลว\nรายละเอียด: {str(e)}"
+        error_msg = f"❌ เปิดออเดอร์ล้มเหลว: {e}"
         send_telegram(error_msg)
         logger.error(error_msg)
         return False
@@ -239,7 +199,7 @@ def move_sl_to_breakeven():
     global sl_moved
     
     try:
-        if sl_moved or not current_position or not entry_price:
+        if sl_moved:
             return
         
         # คำนวณ SL ใหม่ (กันทุน)
@@ -253,16 +213,16 @@ def move_sl_to_breakeven():
         # ในที่นี้จะแจ้งเตือนเฉย ๆ เพราะ OKX มีข้อจำกัด
         
         sl_moved = True
-        message = f"""🔄 ราคาวิ่ง +{be_profit_trigger} แล้ว → เลื่อน SL ไปที่ราคาเข้า (Break-even)
+        message = f"""🔄 เลื่อน SL เป็นกันทุน
 📍 ราคาเข้า: {entry_price:.2f}
-🛡️ SL ใหม่: {new_sl:.2f}"""
+🛡️ SL ใหม่: {new_sl:.2f}
+💚 โพซิชัน: {current_position.upper()}"""
         
         send_telegram(message)
         logger.info(f"SL moved to breakeven: {new_sl}")
         
     except Exception as e:
         logger.error(f"Move SL error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถเลื่อน SL\nรายละเอียด: {str(e)}")
 
 # === ตรวจสอบโพซิชันและจัดการ SL ===
 def monitor_position():
@@ -278,22 +238,7 @@ def monitor_position():
         if not pos_info:
             # โพซิชันถูกปิดแล้ว
             logger.info("Position closed")
-            
-            # หาสาเหตุการปิด
-            current_price = float(exchange.fetch_ticker(symbol)['last'])
-            if current_position == 'long':
-                pnl = current_price - entry_price
-            else:
-                pnl = entry_price - current_price
-            
-            # ตรวจสอบว่าปิดด้วย TP หรือ SL
-            if pnl >= tp_value - 10:  # อนุญาตความคลาดเคลื่อนเล็กน้อย
-                message = f"✅ ปิดออเดอร์ด้วย TP\nกำไร: +{tp_value:.2f} USDT"
-            elif pnl <= -sl_value + 10:
-                message = f"❌ ปิดออเดอร์ด้วย SL\nขาดทุน: -{sl_value:.2f} USDT"
-            else:
-                message = f"ℹ️ ปิดออเดอร์ด้วยเหตุอื่น\nPnL: {pnl:.2f} USDT"
-            
+            message = f"✅ โพซิชัน {current_position.upper()} ถูกปิดแล้ว"
             send_telegram(message)
             
             current_position = None
@@ -318,51 +263,16 @@ def monitor_position():
         
     except Exception as e:
         logger.error(f"Monitor position error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถตรวจสอบโพซิชัน\nรายละเอียด: {str(e)}")
-
-# === ส่งรายงานประจำวัน ===
-def send_daily_report():
-    global last_daily_report
-    
-    try:
-        now = datetime.now()
-        
-        # ตรวจสอบว่ายี่นแล้วหรือยัง
-        if last_daily_report and (now - last_daily_report).total_seconds() < 86400:
-            return
-            
-        # ดึงยอดคงเหลือ
-        balance = get_balance()
-        if balance is None:
-            return
-            
-        # ส่งรายงาน
-        message = f"""⏱ บอทยังทำงานปกติ ✅
-ยอดคงเหลือ: {balance:.2f} USDT"""
-        
-        send_telegram(message)
-        last_daily_report = now
-        logger.info("Sent daily report")
-        
-    except Exception as e:
-        logger.error(f"Daily report error: {e}")
-        send_telegram(f"⛔️ Error: ไม่สามารถส่งรายงานประจำวัน\nรายละเอียด: {str(e)}")
 
 # === MAIN LOOP ===
 def main():
-    global last_daily_report
-    
     send_telegram("🤖 EMA Cross Bot เริ่มทำงาน")
     logger.info("Bot started")
-    last_daily_report = datetime.now()
     
     while True:
         try:
             # ตรวจสอบโพซิชันปัจจุบัน
             monitor_position()
-            
-            # ส่งรายงานประจำวัน
-            send_daily_report()
             
             # ถ้าไม่มีโพซิชัน ให้เช็คสัญญาณ
             if not current_position:
@@ -373,30 +283,18 @@ def main():
                     open_order_with_tpsl(signal)
                     time.sleep(5)  # รอสักครู่หลังเปิดออเดอร์
             
-            time.sleep(5)  # ลดเวลาเช็คเหลือ 5 วินาที
+            time.sleep(15)  # เช็คทุก 15 วินาที
             
         except KeyboardInterrupt:
             logger.info("Bot stopped by user")
             send_telegram("🛑 Bot หยุดทำงานโดยผู้ใช้")
             break
             
-        except ccxt.NetworkError as e:
-            error_msg = f"⛔️ Error: ไม่สามารถเชื่อมต่อ OKX API\nรายละเอียด: {str(e)}\nRetry อีกครั้งใน 30 วินาที"
-            logger.error(error_msg)
-            send_telegram(error_msg)
-            time.sleep(30)
-            
-        except ccxt.ExchangeError as e:
-            error_msg = f"⛔️ Error: ข้อผิดพลาดจาก Exchange\nรายละเอียด: {str(e)}"
-            logger.error(error_msg)
-            send_telegram(error_msg)
-            time.sleep(30)
-            
         except Exception as e:
-            error_msg = f"⛔️ Error: ข้อผิดพลาดไม่ทราบสาเหตุ\nรายละเอียด: {str(e)}"
+            error_msg = f"❌ Main loop error: {e}"
             logger.error(error_msg)
             send_telegram(error_msg)
-            time.sleep(30)
+            time.sleep(30)  # พัก 30 วินาทีเมื่อเกิดข้อผิดพลาด
 
 if __name__ == '__main__':
     main()
